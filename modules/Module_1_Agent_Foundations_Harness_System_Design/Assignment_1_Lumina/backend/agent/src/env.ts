@@ -1,5 +1,6 @@
 import { config } from 'dotenv';
 import { resolve } from 'node:path';
+import { SEARCH_PROVIDERS, VECTOR_BACKENDS } from '@lumina/contract';
 
 // The single .env at the assignment root. Provider keys are read HERE and nowhere else.
 config({ path: resolve(process.cwd(), '../../.env') });
@@ -9,18 +10,32 @@ const num = (v: string | undefined, fallback: number) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
 };
+
+/** `FOO=` in .env is an empty string, not undefined; treat it as unset. */
+const str = (v: string | undefined, fallback: string) => v?.trim() || fallback;
+
+/**
+ * /health names these, so an unrecognised value must stop the process, not be reported
+ * as though it were live. `SEARCH_PROVIDER=serpApi` has no code path behind it.
+ */
+function oneOf<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
+  const v = str(process.env[name], fallback);
+  if (!(allowed as readonly string[]).includes(v)) {
+    throw new Error(`${name}=${v} is not supported; use one of: ${allowed.join(', ')}`);
+  }
+  return v as T;
+}
+
 export const env = {
   port: num(process.env.PORT_AGENT ?? process.env.PORT, 8000),
   mongoUri: process.env.MONGODB_URI ?? '',
-  mongoDb: process.env.MONGODB_DB ?? 'lumina',
-  vectorBackend: (process.env.VECTOR_BACKEND ?? 'atlas-vector-search') as
-    | 'atlas-vector-search'
-    | 'mongo-cosine-scan',
+  mongoDb: str(process.env.MONGODB_DB, 'lumina'),
+  vectorBackend: oneOf('VECTOR_BACKEND', VECTOR_BACKENDS, 'atlas-vector-search'),
 
-  llmProvider: process.env.LLM_PROVIDER ?? 'anthropic',
-  llmModel: process.env.LLM_MODEL ?? 'claude-sonnet-5',
+  llmProvider: str(process.env.LLM_PROVIDER, 'anthropic'),
+  llmModel: str(process.env.LLM_MODEL, 'claude-sonnet-5'),
 
-  searchProvider: (process.env.SEARCH_PROVIDER ?? 'tavily') as 'tavily' | 'serpapi',
+  searchProvider: oneOf('SEARCH_PROVIDER', SEARCH_PROVIDERS, 'tavily'),
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
 
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',

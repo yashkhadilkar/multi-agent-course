@@ -57,17 +57,22 @@ mkdirSync(env.runsDir, { recursive: true });
 
 // ---------------------------------------------------------------- /health (implemented)
 
+// No X-User-Id here: the grader and Fly's health check call it bare. `ai` is left off on
+// purpose, because the gateway nests this whole body there; the agent does not grade itself.
 app.get('/health', async (_req, res) => {
-  const dbStatus = await pingDb();
-  const body: HealthResponse = {
-    status: dbStatus === 'ok' ? 'ok' : 'degraded',
+  const ping = await pingDb();
+  // Log the reason but keep it out of the body: a driver error can name the cluster host.
+  if (ping.status === 'down') log.error({ err: ping.error }, 'health: mongo ping failed');
+
+  const body = HealthResponse.parse({
+    status: ping.status === 'ok' ? 'ok' : 'degraded',
     model: env.llmModel,
     searchProvider: env.searchProvider,
     vectorStore: env.vectorBackend,
-    db: dbStatus,
-    ai: { status: 'ok' }
-  };
-  res.status(dbStatus === 'ok' ? 200 : 503).json(body);
+    db: ping.status
+  });
+  // 503 when degraded, the same convention the gateway uses; bench reads the body either way.
+  res.status(ping.status === 'ok' ? 200 : 503).json(body);
 });
 
 // ---------------------------------------------------------------- everything else: 501
