@@ -36,6 +36,7 @@ import { cachedSearch, isTimeSensitive } from './cache.js';
 import { env, secrets } from './env.js';
 import { MAX_MEMORY_CHARS, recallMemories, saveMemory, type RecalledMemory } from './memory.js';
 import { selectPassages } from './passages.js';
+import { recordAnswer } from './runlog.js';
 import { FetchError, SearchProviderError, fetchPage, hostOf, type SearchResult } from './search.js';
 import { CitationFilter, SseStream } from './sse.js';
 import type { SavedAnswer } from './threads.js';
@@ -129,6 +130,7 @@ How to research:
 - Before your first turn the question has already been searched once, as asked, and the top results read. Their passages come with the question.
 - If those passages answer the question, answer straight away. If not, use web_search and fetch_page to look further. Make independent calls in parallel, in the same turn.
 - A run has at most ${env.maxToolCalls} tool calls, including the ones already made for you; the question says how many are left.
+- At most ${env.maxConsecutiveSameTool} calls in a row may use the same tool, counting the reads already made for you. A call past that is refused: answer from what you have, or use a different tool.
 - Write no text before or between tool calls. The only text you write is the final answer.
 
 Memory:
@@ -244,7 +246,10 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   const searchQueries: string[] = [];
   const pages: Page[] = [];
   const pageByUrl = new Map<string, Page>();
-  const toolCalls: RunLog['toolCalls'] = [];
+  // Pushed as calls finish; the run log lists them by step, the order they were made.
+  const calls: { step: number; call: RunLog['toolCalls'][number] }[] = [];
+  /** Calls the thrash guard refused. Traced, but not in the run log, since they never ran. */
+  const refused: { step: number; tool: ToolName }[] = [];
   // `searches` is provider calls, the ones that cost money; a cache hit is not one.
   const usage = { in: 0, out: 0, searches: 0, extracts: 0 };
   const cache = { searches: 0, hits: 0, readErrors: 0 };
@@ -287,6 +292,17 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   let step = 0;
   let fetchAttempts = 0;
 
+  // The thrash guard (rule A3). Steps are reserved in the order calls are made, and the
+  // streak is counted in that same order, so it covers the up-front reads too.
+  let streakTool = null as ToolName | null;
+  let streak = 0;
+  /** The next step, for a call that will run. */
+  const reserve = (tool: ToolName): number => {
+    streak = tool === streakTool ? streak + 1 : 1;
+    streakTool = tool;
+    return ++step;
+  };
+
   const trace = (
     s: number,
     tool: ToolName,
@@ -295,14 +311,52 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     outcome: { ok: true; reason: string } | { ok: false; reason: string; error: string }
   ) => {
     const ms = Date.now() - t0;
-    toolCalls.push(outcome.ok ? { name: tool, ok: true, ms } : { name: tool, ok: false, error: outcome.error, ms });
+    calls.push({ step: s, call: outcome.ok ? { name: tool, ok: true, ms } : { name: tool, ok: false, error: outcome.error, ms } });
     sse.send('trace', { step: s, tool, input, ok: outcome.ok, ms, reason: outcome.reason, ...(outcome.ok ? {} : { error: outcome.error }) });
   };
 
-  /** A tool signal that dies with the run, or after the per-call timeout. */
-  const toolSignal = (timeoutMs = env.fetchTimeoutMs) => AbortSignal.any([abort.signal, AbortSignal.timeout(timeoutMs)]);
+  /** A tool signal that dies with the run, with its batch (see settleBatch), or after the per-call timeout. */
+  const toolSignal = (batch: AbortSignal | undefined, timeoutMs = env.fetchTimeoutMs) =>
+    AbortSignal.any([abort.signal, ...(batch ? [batch] : []), AbortSignal.timeout(timeoutMs)]);
 
-  async function runWebSearch(s: number, raw: unknown): Promise<{ content: string; results: SearchResult[] }> {
+  /**
+   * Why a call was stopped from outside, as its step's error; null when it failed on its own.
+   * A call that was stopped is still traced, so the run log shows every call that was made.
+   */
+  const cutShort = (batch: AbortSignal | undefined): string | null => {
+    if (abort.signal.aborted) {
+      const r: unknown = abort.signal.reason;
+      return r instanceof WallClockCap
+        ? `cancelled at the ${env.maxWallClockSec} s wall-clock cap`
+        : `cancelled: ${(r as Error | undefined)?.message || 'the run was aborted'}`;
+    }
+    return batch?.aborted ? String((batch.reason as Error).message) : null;
+  };
+
+  /**
+   * Runs one batch of parallel tool calls. The first call to throw cancels the rest of the
+   * batch, and every call settles, tracing its step, before that first error goes on to end
+   * the run. A plain Promise.all would record the run while its siblings were still in flight.
+   */
+  async function settleBatch<T>(calls: ((batch: AbortSignal) => Promise<T>)[]): Promise<T[]> {
+    const batch = new AbortController();
+    let failure = null as { reason: unknown } | null;
+    const settled = await Promise.allSettled(
+      calls.map((call) =>
+        call(batch.signal).catch((reason: unknown) => {
+          if (!failure) {
+            failure = { reason };
+            batch.abort(new Error(`cancelled because a parallel call failed: ${(reason as Error).message || 'unknown error'}`));
+          }
+          throw reason;
+        })
+      )
+    );
+    if (failure) throw failure.reason;
+    return settled.map((r) => (r as PromiseFulfilledResult<T>).value);
+  }
+
+  async function runWebSearch(s: number, raw: unknown, batch?: AbortSignal): Promise<{ content: string; results: SearchResult[] }> {
     const t0 = Date.now();
     const parsed = WebSearchInput.safeParse(raw);
     if (!parsed.success) {
@@ -317,7 +371,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     try {
       const bypass = freshQuestion || isTimeSensitive(query);
       cache.searches++;
-      const r = await cachedSearch(query, toolSignal(), { bypass, log, requestId: ask.requestId });
+      const r = await cachedSearch(query, toolSignal(batch), { bypass, log, requestId: ask.requestId });
       results = r.results;
       if (r.from === 'lru' || r.from === 'mongo') cache.hits++;
       else usage.searches++;
@@ -331,7 +385,11 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
               ? 'cache miss'
               : `cache hit (${r.from})`;
     } catch (err) {
-      if (abort.signal.aborted) throw err;
+      const cancelled = cutShort(batch);
+      if (cancelled) {
+        trace(s, 'web_search', { query }, t0, { ok: false, reason: reason ?? 'search', error: cancelled });
+        throw err;
+      }
       // The provider is down: trace it, then end the run. There is nothing to answer from.
       const e = err instanceof SearchProviderError ? err : new SearchProviderError(`${env.searchProvider}: ${(err as Error).message}`);
       trace(s, 'web_search', { query }, t0, { ok: false, reason: reason ?? 'search', error: e.message });
@@ -352,7 +410,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   async function runFetchPage(
     s: number,
     raw: unknown,
-    timeoutMs = env.fetchTimeoutMs
+    timeoutMs = env.fetchTimeoutMs,
+    batch?: AbortSignal
   ): Promise<{ content: string; isError: boolean }> {
     const t0 = Date.now();
     const parsed = FetchPageInput.safeParse(raw);
@@ -380,9 +439,13 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     fetchAttempts++;
     try {
       if (env.searchProvider === 'tavily') usage.extracts++;
-      ({ text, title: fetchedTitle } = await fetchPage(hit.url, toolSignal(timeoutMs)));
+      ({ text, title: fetchedTitle } = await fetchPage(hit.url, toolSignal(batch, timeoutMs)));
     } catch (err) {
-      if (abort.signal.aborted) throw err;
+      const cancelled = cutShort(batch);
+      if (cancelled) {
+        trace(s, 'fetch_page', { url }, t0, { ok: false, reason, error: cancelled });
+        throw err;
+      }
       const timedOut = err instanceof DOMException && err.name === 'TimeoutError';
       const error = timedOut ? `timed out after ${timeoutMs}ms` : err instanceof FetchError ? err.message : (err as Error).message;
       return fail({ url }, reason, error || 'fetch failed');
@@ -405,10 +468,10 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   }
 
   /** Always the run's first step. A failure is a failed step, not a failed run: the answer goes on without memory, and says so in the trace. */
-  async function runRecall(s: number, query: string): Promise<{ memories: RecalledMemory[]; error?: string }> {
+  async function runRecall(s: number, query: string, batch?: AbortSignal): Promise<{ memories: RecalledMemory[]; error?: string }> {
     const t0 = Date.now();
     try {
-      const memories = await recallMemories(ask.userId, query, toolSignal());
+      const memories = await recallMemories(ask.userId, query, toolSignal(batch));
       trace(s, 'recall_memory', { query }, t0, {
         ok: true,
         reason: memories.length
@@ -417,7 +480,11 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       });
       return { memories };
     } catch (err) {
-      if (abort.signal.aborted) throw err;
+      const cancelled = cutShort(batch);
+      if (cancelled) {
+        trace(s, 'recall_memory', { query }, t0, { ok: false, reason: 'recall stopped before it finished', error: cancelled });
+        throw err;
+      }
       const error = (err as Error).message || 'recall failed';
       log.error({ requestId: ask.requestId, err }, 'recall_memory failed; answering without memory');
       trace(s, 'recall_memory', { query }, t0, { ok: false, reason: 'answering without saved memories', error });
@@ -425,7 +492,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     }
   }
 
-  async function runSaveMemory(s: number, raw: unknown): Promise<{ content: string; isError: boolean }> {
+  async function runSaveMemory(s: number, raw: unknown, batch?: AbortSignal): Promise<{ content: string; isError: boolean }> {
     const t0 = Date.now();
     const parsed = SaveMemoryInput.safeParse(raw);
     if (!parsed.success) {
@@ -435,7 +502,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     }
     const { text, reason = 'remember' } = parsed.data;
     try {
-      const r = await saveMemory(ask.userId, text, ask.threadId, toolSignal());
+      const r = await saveMemory(ask.userId, text, ask.threadId, toolSignal(batch));
       if (r.saved) {
         trace(s, 'save_memory', { text }, t0, { ok: true, reason: `${reason} → saved as ${r.id}` });
         return { content: `Saved (${r.id}). It applies to this user's future conversations.`, isError: false };
@@ -443,7 +510,11 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       trace(s, 'save_memory', { text }, t0, { ok: true, reason: `${reason} → already remembered as ${r.duplicateOf.id}, not saved again` });
       return { content: `Already remembered: "${r.duplicateOf.text}". Nothing new was saved.`, isError: false };
     } catch (err) {
-      if (abort.signal.aborted) throw err;
+      const cancelled = cutShort(batch);
+      if (cancelled) {
+        trace(s, 'save_memory', { text }, t0, { ok: false, reason, error: cancelled });
+        throw err;
+      }
       const error = (err as Error).message || 'save failed';
       log.error({ requestId: ask.requestId, err }, 'save_memory failed');
       trace(s, 'save_memory', { text }, t0, { ok: false, reason, error });
@@ -453,8 +524,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
 
   /** Runs one turn's tool calls in parallel. Slots are reserved in the model's order, before any await. */
   async function runTools(uses: Anthropic.ToolUseBlock[]): Promise<Anthropic.ToolResultBlockParam[]> {
-    return Promise.all(
-      uses.map(async (tu): Promise<Anthropic.ToolResultBlockParam> => {
+    return settleBatch(
+      uses.map((tu) => async (batch: AbortSignal): Promise<Anthropic.ToolResultBlockParam> => {
         const result = (content: string, isError = false): Anthropic.ToolResultBlockParam => ({
           type: 'tool_result',
           tool_use_id: tu.id,
@@ -469,9 +540,27 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
           capped = true;
           return result(`Error: not run, the tool-call cap of ${env.maxToolCalls} is reached.`, true);
         }
-        const s = ++step;
-        if (tu.name === 'web_search') return result((await runWebSearch(s, tu.input)).content);
-        const r = tu.name === 'save_memory' ? await runSaveMemory(s, tu.input) : await runFetchPage(s, tu.input);
+        const tool = tu.name as ToolName;
+        if (tool === streakTool && streak >= env.maxConsecutiveSameTool) {
+          // A trace step, so it takes a slot under the tool-call cap like any other: the
+          // model cannot dodge the cap by retrying into the guard.
+          const s = ++step;
+          const error =
+            `refused: this would be ${tool} call ${streak + 1} in a row, and the limit is ` +
+            `${env.maxConsecutiveSameTool} consecutive calls to one tool`;
+          refused.push({ step: s, tool });
+          sse.send('trace', { step: s, tool, input: asInput(tu.input), ok: false, ms: 0, reason: 'thrash guard, not run', error });
+          return result(
+            `Error: not run. ${error}. Answer now from what you already have, or use a different tool.`,
+            true
+          );
+        }
+        const s = reserve(tool);
+        if (tu.name === 'web_search') return result((await runWebSearch(s, tu.input, batch)).content);
+        const r =
+          tu.name === 'save_memory'
+            ? await runSaveMemory(s, tu.input, batch)
+            : await runFetchPage(s, tu.input, env.fetchTimeoutMs, batch);
         return result(r.content, r.isError);
       })
     );
@@ -543,18 +632,29 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     // follow-up that points back ("does it…") is searched with the question before it.
     // Recall runs alongside it: neither needs the other, so it costs no time to first token.
     const withContext = firstSearchQuery(ask);
-    const recallStep = ++step;
-    const [recalled, first] = await Promise.all([
-      runRecall(recallStep, withContext ?? ask.query),
-      runWebSearch(++step, {
-        query: withContext ?? ask.query.slice(0, 400),
-        reason: withContext ? 'the follow-up, with the earlier question it refers back to' : 'the question as asked'
-      })
-    ]);
+    const recallStep = reserve('recall_memory');
+    const searchStep = reserve('web_search');
+    const [recalled, first] = (await settleBatch<unknown>([
+      (batch) => runRecall(recallStep, withContext ?? ask.query, batch),
+      (batch) =>
+        runWebSearch(
+          searchStep,
+          {
+            query: withContext ?? ask.query.slice(0, 400),
+            reason: withContext ? 'the follow-up, with the earlier question it refers back to' : 'the question as asked'
+          },
+          batch
+        )
+    ])) as [Awaited<ReturnType<typeof runRecall>>, Awaited<ReturnType<typeof runWebSearch>>];
     const top = first.results.slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
-    // ++step runs synchronously per result, so steps are numbered in rank order.
-    const reads = await Promise.all(
-      top.map((r) => runFetchPage(++step, { url: r.url, reason: 'top result, read up front' }, env.prefetchTimeoutMs))
+    // Reserved synchronously per result, so steps are numbered in rank order. These count
+    // toward the thrash guard's streak like any fetch_page the model makes.
+    const reads = await settleBatch(
+      top.map((r) => {
+        const s = reserve('fetch_page');
+        return (batch: AbortSignal) =>
+          runFetchPage(s, { url: r.url, reason: 'top result, read up front' }, env.prefetchTimeoutMs, batch);
+      })
     );
     const read = reads.filter((r) => !r.isError).map((r) => r.content);
     const unread = top.flatMap((r, i) => (reads[i]?.isError ? [`${r.url} (${reads[i]!.content.replace(/^Error: /, '')})`] : []));
@@ -656,7 +756,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
           ? `llm provider: ${err.message}`
           : (err as Error).message;
       clearTimeout(hardStop);
-      finish({ error: message });
+      await finish(status, { error: message }).catch(recordFailed);
       if (!gone) {
         log.error({ requestId: ask.requestId, err }, 'ask failed');
         sse.fail(status, message, ask.requestId);
@@ -674,16 +774,28 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   } catch (err) {
     terminated = 'error';
     const message = 'saving the answer to the thread failed';
-    finish({ error: `${message}: ${(err as Error).message}` });
     log.error({ requestId: ask.requestId, err }, message);
+    await finish(502, { error: `${message}: ${(err as Error).message}` }).catch(recordFailed);
     sse.fail(502, message, ask.requestId);
     return;
   }
-  finish({}, done);
+  // Recorded before `done` as well: a client that has seen `done` can see the answer in
+  // /stats, and an answer with no run log is one the gates never grade, so it fails loud.
+  try {
+    await finish(200, {}, done);
+  } catch (err) {
+    recordFailed(err);
+    sse.fail(502, 'recording the run log failed', ask.requestId);
+    return;
+  }
   sse.send('done', done);
   sse.end();
 
   // ---------------------------------------------------------------- accounting
+
+  function recordFailed(err: unknown) {
+    log.error({ requestId: ask.requestId, err }, 'recording the run log failed');
+  }
 
   function measure(): DoneEvent {
     const latencyMs = Date.now() - started;
@@ -707,17 +819,17 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     };
   }
 
-  function finish(extra: { error?: string } = {}, done = measure()) {
+  /** The answer's log line, then its run log and request record. `status` is what the answer ended with. */
+  async function finish(status: number, extra: { error?: string } = {}, done = measure()): Promise<void> {
     const { latencyMs } = done;
-    // The run log in the quality kit's shape. Persisting it is the next step; for now it
-    // rides on the answer's log line.
+    // The run log in the quality kit's shape: the same object is logged and stored.
     const runLog: RunLog = {
       tokens: usage.in + usage.out,
       wallClockSec: latencyMs / 1000,
       costUsd: done.costUsd,
       terminated,
       depth: 'quick',
-      toolCalls
+      toolCalls: [...calls].sort((a, b) => a.step - b.step).map((c) => c.call)
     };
     log.info(
       {
@@ -725,7 +837,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         userId: ask.userId,
         threadId: ask.threadId,
         answerId,
-        toolCalls: toolCalls.length,
+        toolCalls: runLog.toolCalls.length,
+        refused,
         terminated,
         tokens: done.tokens,
         costUsd: done.costUsd,
@@ -742,6 +855,19 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       },
       'answer'
     );
-    return done;
+    await recordAnswer({
+      requestId: ask.requestId,
+      userId: ask.userId,
+      threadId: ask.threadId,
+      answerId,
+      query: ask.query,
+      route: '/threads/:threadId/ask',
+      status,
+      run: runLog,
+      tokensIn: done.tokens.in,
+      tokensOut: done.tokens.out,
+      ttftMs: done.ttftMs,
+      searchCached: done.searchCached
+    });
   }
 }

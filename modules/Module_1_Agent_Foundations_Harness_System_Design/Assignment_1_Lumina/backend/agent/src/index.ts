@@ -38,12 +38,12 @@
  */
 import express from 'express';
 import pino from 'pino';
-import { mkdirSync } from 'node:fs';
 import { AskBody, CreateThreadBody, HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER, newId } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
 import { deleteMemory, listMemories } from './memory.js';
 import { runQuick } from './quick.js';
+import { computeStats } from './runlog.js';
 import { beginTurn, createThread, findThread, getThread, listThreads, saveAnswer } from './threads.js';
 
 const log = pino({ level: env.logLevel });
@@ -55,8 +55,6 @@ app.use((req, res, next) =>
     ? next()
     : express.json({ limit: '1mb' })(req, res, next)
 );
-
-mkdirSync(env.runsDir, { recursive: true });
 
 // ---------------------------------------------------------------- request id + X-User-Id
 
@@ -114,6 +112,16 @@ app.get('/health', async (_req, res) => {
   // 503 when degraded, the same convention the gateway uses; bench reads the body either way.
   res.status(ping.status === 'ok' ? 200 : 503).json(body);
 });
+
+// ---------------------------------------------------------------- /stats
+
+// Computed from the stored request records on every call, so it cannot drift from the run logs.
+app.get(
+  '/stats',
+  handle('computing stats', async (_req, res, { userId }) => {
+    res.json(await computeStats(userId));
+  })
+);
 
 // ---------------------------------------------------------------- threads
 
@@ -209,6 +217,7 @@ const notImplemented = (route: string) => (_req: express.Request, res: express.R
 
 const IMPLEMENTED = new Set([
   'GET /health',
+  'GET /stats',
   'GET /evals/report.json',
   'POST /threads',
   'GET /threads',

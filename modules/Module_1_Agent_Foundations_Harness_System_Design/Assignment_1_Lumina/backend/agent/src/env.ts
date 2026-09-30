@@ -62,10 +62,10 @@ export const env = {
   maxWallClockSec: num(process.env.MAX_WALL_CLOCK_SEC, 90),
   maxToolCallsDeep: num(process.env.MAX_TOOL_CALLS_DEEP, 24),
   maxWallClockSecDeep: num(process.env.MAX_WALL_CLOCK_SEC_DEEP, 240),
+  /** expectations.json trajectory.maxConsecutiveSameTool (rule A3): the longest run of one tool. */
+  maxConsecutiveSameTool: num(process.env.MAX_CONSECUTIVE_SAME_TOOL, 4),
 
-  logLevel: process.env.LOG_LEVEL ?? 'info',
-  /** Where the per-answer run logs land. quality/check.mjs reads this folder. */
-  runsDir: resolve(process.cwd(), '../../runs')
+  logLevel: process.env.LOG_LEVEL ?? 'info'
 } as const;
 
 /** Never log or return these. /health names the model; it never echoes a key. */
