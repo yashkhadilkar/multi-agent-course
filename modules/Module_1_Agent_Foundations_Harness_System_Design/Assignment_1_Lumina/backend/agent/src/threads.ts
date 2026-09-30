@@ -42,8 +42,8 @@ const LIST_LIMIT = 100;
 /** Answers kept nearly whole: a follow-up almost always leans on the last one or two. */
 const RECENT_ANSWERS = 2;
 const RECENT_ANSWER_CHARS = 2000;
-/** Everything older is cut to about its first few sentences. */
-const OLDER_ANSWER_CHARS = 400;
+/** Everything older is cut to about its first sentence or two, where the direct answer is. */
+const OLDER_ANSWER_CHARS = 200;
 const QUESTION_CHARS = 500;
 /** Source titles shown with a recent answer, so "the second one" still means something. */
 const HISTORY_SOURCE_TITLES = 6;
@@ -118,7 +118,7 @@ export async function beginTurn(
   userId: string,
   threadId: string,
   query: string
-): Promise<{ questionId: string; history: Anthropic.MessageParam[] }> {
+): Promise<{ questionId: string; history: Anthropic.MessageParam[]; earlierQuestions: string[] }> {
   const questionId = messageId();
   const col = await messages();
   const question = MessageDoc.parse({
@@ -140,7 +140,11 @@ export async function beginTurn(
       )
     )
   ]);
-  return { questionId, history: historyMessages(rows) };
+  return {
+    questionId,
+    history: historyMessages(rows),
+    earlierQuestions: rows.filter((r) => r.role === 'user').map((r) => r.content)
+  };
 }
 
 /** Called before `done` is sent, so a failed save can still end the stream as an error. */
@@ -196,7 +200,7 @@ function renderAnswer(a: StoredMessage, recent: boolean): string {
  * with no saved answer (its run errored, or is still running) gets a placeholder, so the
  * turns still alternate and the model is not left guessing what was said.
  */
-function historyMessages(rows: StoredMessage[]): Anthropic.MessageParam[] {
+export function historyMessages(rows: StoredMessage[]): Anthropic.MessageParam[] {
   const answers = new Map<string, StoredMessage>();
   for (const r of rows) if (r.role === 'assistant' && r.replyTo) answers.set(r.replyTo, r);
   const questions = rows.filter((r) => r.role === 'user');

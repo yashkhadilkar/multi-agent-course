@@ -165,7 +165,7 @@ app.post(
     if (ask.mode === 'docs' || ask.spaceId) return reject(res, 501, 'not implemented yet: document search (mode "docs" / spaceId)');
 
     // The question is saved whatever the run's outcome; the answer only if it ends done or cap.
-    const { questionId, history } = await beginTurn(userId, threadId, ask.query);
+    const { questionId, history, earlierQuestions } = await beginTurn(userId, threadId, ask.query);
     await runQuick(
       {
         requestId,
@@ -173,6 +173,7 @@ app.post(
         threadId,
         query: ask.query,
         history,
+        earlierQuestions,
         saveAnswer: (answer) => saveAnswer(userId, threadId, questionId, answer)
       },
       res,

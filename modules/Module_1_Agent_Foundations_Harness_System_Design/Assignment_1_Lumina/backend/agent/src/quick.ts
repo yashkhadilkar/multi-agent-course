@@ -128,6 +128,8 @@ export type QuickAsk = {
   query: string;
   /** Earlier turns of the thread, already trimmed, as alternating user/assistant messages. */
   history: Anthropic.MessageParam[];
+  /** The thread's earlier questions, whole and oldest first, for a follow-up's first search. */
+  earlierQuestions: string[];
   /** Persists a done or capped answer. Runs before `done` is sent; a throw ends the run as an error. */
   saveAnswer: (answer: SavedAnswer) => Promise<void>;
 };
@@ -144,6 +146,46 @@ const asInput = (raw: unknown): Record<string, unknown> =>
   raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
 
 const normUrl = (u: string) => u.replace(/#.*$/, '').replace(/\/+$/, '');
+
+// ---------------------------------------------------------------- follow-ups
+
+/** Search queries are capped at this many characters. */
+const MAX_QUERY_CHARS = 400;
+const POINTS_BACK = /\b(?:it|its|they|them|this|that|these|those)\b/gi;
+const FOLLOW_UP_OPENER = /^\s*(?:what about|how about|and)\b/i;
+/**
+ * The question names its own subject before the pronoun, so the pronoun points inside the
+ * question: a "what is X" opener ("What is GridFS and when should you use it…"), or a
+ * capitalised name after the first word ("How does SerpApi price its…"; "I" does not count).
+ */
+const WHAT_IS_OPENER = /^\s*(?:what|who)\s+(?:is|are)\s+(?!(?:it|its|they|them|this|that|these|those)\b)\w/i;
+const NAME_AFTER_FIRST_WORD = /\S\s+(?!I\b)[A-Z]/;
+/** "What would it cost to…", "how long does it take to…": an "it" standing in for the rest of the sentence. */
+const PLACEHOLDER_IT = /^it\s+\w+\s+to\b/i;
+
+/** Whether a question leans on an earlier turn for what it is about. */
+export function refersBack(query: string): boolean {
+  if (FOLLOW_UP_OPENER.test(query)) return true;
+  return [...query.matchAll(POINTS_BACK)].some((m) => {
+    if (PLACEHOLDER_IT.test(query.slice(m.index))) return false;
+    const before = query.slice(0, m.index);
+    return !WHAT_IS_OPENER.test(before) && !NAME_AFTER_FIRST_WORD.test(before);
+  });
+}
+
+/**
+ * The first search for a follow-up that points back: the latest earlier question that names
+ * its own subject, then this one. Pairing with the previous question alone fails on a chain
+ * ("does it…", then "and its…"), where the previous question has no subject either.
+ * Null for everything else, which is searched exactly as asked, so a standalone question
+ * keeps its cache key however long the thread is.
+ */
+function firstSearchQuery(ask: QuickAsk): string | null {
+  if (!ask.earlierQuestions.length || !refersBack(ask.query) || ask.query.length >= MAX_QUERY_CHARS - 20) return null;
+  const anchor = ask.earlierQuestions.filter((q) => !refersBack(q)).at(-1) ?? ask.earlierQuestions.at(-1)!;
+  const room = MAX_QUERY_CHARS - ask.query.length - 1;
+  return `${anchor.replace(/\s+/g, ' ').trim().slice(0, room)} ${ask.query}`;
+}
 
 export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promise<void> {
   const started = Date.now();
@@ -412,8 +454,13 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
 
   let terminated: Terminated = 'done';
   try {
-    // ---- step one, no model: search the question as asked, read the top results.
-    const first = await runWebSearch(++step, { query: ask.query.slice(0, 400), reason: 'the question as asked' });
+    // ---- step one, no model: search the question as asked, read the top results. A
+    // follow-up that points back ("does it…") is searched with the question before it.
+    const withContext = firstSearchQuery(ask);
+    const first = await runWebSearch(++step, {
+      query: withContext ?? ask.query.slice(0, 400),
+      reason: withContext ? 'the follow-up, with the earlier question it refers back to' : 'the question as asked'
+    });
     const top = first.results.slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
     // ++step runs synchronously per result, so steps are numbered in rank order.
     const reads = await Promise.all(
@@ -426,13 +473,13 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       content: [
         ask.query,
         '---',
-        `The question was searched as asked (${step} of ${env.maxToolCalls} tool calls used, ${Math.max(0, env.maxToolCalls - step)} left).`,
+        `The question was searched ${withContext ? 'together with the earlier question it refers back to' : 'as asked'} (${step} of ${env.maxToolCalls} tool calls used, ${Math.max(0, env.maxToolCalls - step)} left).`,
         `Search results:\n${first.content}`,
         read.length ? `Pages read, cite them by their source number:\n\n${read.join('\n\n---\n\n')}` : '',
         unread.length ? `Not read in time (fetch_page can retry with a longer timeout):\n${unread.join('\n')}` : '',
-        // The up-front search had only the follow-up's own words, which may not name what it is about.
-        ask.history.length
-          ? 'This is a follow-up. If these results miss what it refers to in the conversation, search again with that spelled out.'
+        // Searched on its own words: right for a new topic, wrong for a follow-up the heuristic missed.
+        ask.history.length && !withContext
+          ? 'If this question continues the conversation and these results miss what it is about, search again with that spelled out.'
           : '',
         'If the pages answer the question, answer now. If not, search again or read more results.'
       ]
