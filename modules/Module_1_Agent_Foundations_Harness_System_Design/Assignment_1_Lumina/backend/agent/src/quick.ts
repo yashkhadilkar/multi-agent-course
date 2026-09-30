@@ -28,9 +28,10 @@ import type { Response } from 'express';
 import type { Logger } from 'pino';
 import { z } from 'zod';
 import { newId, type RunLog, type Source, type Terminated, type ToolName } from '@lumina/contract';
+import { cachedSearch, isTimeSensitive } from './cache.js';
 import { env, secrets } from './env.js';
 import { selectPassages } from './passages.js';
-import { FetchError, SearchProviderError, fetchPage, hostOf, webSearch, type SearchResult } from './search.js';
+import { FetchError, SearchProviderError, fetchPage, hostOf, type SearchResult } from './search.js';
 import { CitationFilter, SseStream } from './sse.js';
 
 /** Words of each fetched page the model reads. Four pages of this stay well inside quick's cost budget. */
@@ -150,7 +151,12 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   const pages: Page[] = [];
   const pageByUrl = new Map<string, Page>();
   const toolCalls: RunLog['toolCalls'] = [];
+  // `searches` is provider calls, the ones that cost money; a cache hit is not one.
   const usage = { in: 0, out: 0, searches: 0, extracts: 0 };
+  const cache = { searches: 0, hits: 0, readErrors: 0 };
+  // A time-sensitive question keeps every search in the run fresh, not only the ones
+  // whose own wording says so: the model's follow-up queries may drop the "latest".
+  const freshQuestion = isTimeSensitive(ask.query);
 
   let capped = false;
   let snippetFallback = false;
@@ -212,9 +218,23 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     const { query, reason } = parsed.data;
     searchQueries.push(query);
     let results: SearchResult[];
+    let cacheNote: string;
     try {
-      usage.searches++;
-      results = await webSearch(query, toolSignal());
+      const bypass = freshQuestion || isTimeSensitive(query);
+      cache.searches++;
+      const r = await cachedSearch(query, toolSignal(), { bypass, log, requestId: ask.requestId });
+      results = r.results;
+      if (r.from === 'lru' || r.from === 'mongo') cache.hits++;
+      else usage.searches++;
+      if (r.cacheError) cache.readErrors++;
+      cacheNote =
+        r.from === 'bypass'
+          ? 'time-sensitive, cache bypassed'
+          : r.cacheError
+            ? `${r.cacheError}, searched live`
+            : r.from === 'miss'
+              ? 'cache miss'
+              : `cache hit (${r.from})`;
     } catch (err) {
       if (abort.signal.aborted) throw err;
       // The provider is down: trace it, then end the run. There is nothing to answer from.
@@ -225,7 +245,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     for (const r of results) if (!searchResults.has(normUrl(r.url))) searchResults.set(normUrl(r.url), r);
     trace(s, 'web_search', { query }, t0, {
       ok: true,
-      reason: `${reason ?? 'search'} → ${results.length ? `${results.length} results` : 'no results'}`
+      reason: `${reason ?? 'search'} → ${results.length ? `${results.length} results` : 'no results'} · ${cacheNote}`
     });
     if (!results.length) return { content: 'No results.', results };
     const content = results
@@ -509,8 +529,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       model: env.llmModel,
       tokens: { in: usage.in, out: usage.out },
       costUsd: Math.round(costUsd * 1e6) / 1e6,
-      // No search cache yet, so no search was ever a hit.
-      searchCached: false,
+      // Only when every search in the request hit. No search at all is not a hit.
+      searchCached: cache.searches > 0 && cache.hits === cache.searches,
       terminated,
       depth: 'quick' as const,
       subQuestions: 0
@@ -536,6 +556,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         tokens: done.tokens,
         costUsd: done.costUsd,
         searchCached: done.searchCached,
+        searchCache: cache,
         ttftMs: done.ttftMs,
         latencyMs,
         depth: 'quick',
