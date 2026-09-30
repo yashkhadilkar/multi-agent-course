@@ -40,6 +40,8 @@ export const env = {
 
   /** A single page read gives up after this; one slow publisher must not eat the budget. */
   fetchTimeoutMs: num(process.env.FETCH_TIMEOUT_MS, 10000),
+  /** The up-front reads of the top results get much less: they are on the path to the first token. */
+  prefetchTimeoutMs: num(process.env.PREFETCH_TIMEOUT_MS, 1500),
 
   // Prices behind done.costUsd. The defaults are the declared table in
   // benchmark/sla.json (cost_model), so the agent and the bench price a run the same way.

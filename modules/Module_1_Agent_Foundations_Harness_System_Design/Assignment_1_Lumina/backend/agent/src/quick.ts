@@ -14,6 +14,11 @@
  *   5. No page readable at all → the answer falls back to the search snippets; nothing
  *      retrieved → the answer says so and cites nothing.
  *
+ * Step one needs no model call: the question is searched as asked, and the top results
+ * are read in parallel under a short timeout, keeping whatever pages return in time. The
+ * model's first turn already has those pages, so a simple question is answered in one
+ * LLM call; a harder one can still search and read more, inside the same caps.
+ *
  * The final answer is the model's last turn, streamed as it is written. Text the model
  * writes before a tool call (a preamble) is held back until the turn shows whether it is
  * an answer, and discarded if it is not.
@@ -34,6 +39,13 @@ const PAGE_WORDS = 700;
 const ANSWER_RESERVE_MS = 15_000;
 /** Thinking counts against this too. It bounds the cost of any one turn. */
 const MAX_TOKENS_PER_TURN = 2048;
+/** How many of the first search's results are read before the model is called. */
+const PREFETCH_PAGES = 3;
+/**
+ * With pages in hand the model may answer at once, or open with a preamble and then call a
+ * tool. Its text is committed as the answer once it cites a source or runs this long.
+ */
+const COMMIT_AFTER_CHARS = 160;
 
 // ---------------------------------------------------------------- tools
 
@@ -86,14 +98,15 @@ function systemPrompt(): string {
   return `You are LUMINA, a search assistant that answers only from web pages it has actually read. Today is ${today}.
 
 How to research:
-- Always search before answering. Then read the 2-4 most promising results with fetch_page. Make independent calls in parallel, in the same turn.
-- You have at most ${env.maxToolCalls} tool calls in total. A simple factual question needs one search and one or two pages.
+- Before your first turn the question has already been searched once, as asked, and the top results read. Their passages come with the question.
+- If those passages answer the question, answer straight away. If not, use web_search and fetch_page to look further. Make independent calls in parallel, in the same turn.
+- A run has at most ${env.maxToolCalls} tool calls, including the ones already made for you; the question says how many are left.
 - Write no text before or between tool calls. The only text you write is the final answer.
 
 How to answer:
 - Put the direct answer in the first sentence, then only what the question needs. Keep it under about 150 words unless the question asks for depth; no headings for a short answer.
 - Each page you read has a source number. Cite a claim by putting that number in square brackets right after it, like this [2]. One number per bracket: [1][3], never [1, 3].
-- Cite only the source numbers fetch_page gave you. Search results are not sources.
+- Cite only the source numbers given with the pages you read. Search results are not sources.
 - Make claims only from the passages you read. If they do not answer the question, say that plainly instead of guessing.`;
 }
 
@@ -130,7 +143,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     if (!res.writableFinished) abort.abort(new ClientGone('client disconnected'));
   });
 
-  const messages: Anthropic.MessageParam[] = [{ role: 'user', content: ask.query }];
+  // The first message is built from the up-front search and reads, before the first turn.
+  const messages: Anthropic.MessageParam[] = [];
   const searchResults = new Map<string, SearchResult>(); // normalized url → first result that named it
   const searchQueries: string[] = [];
   const pages: Page[] = [];
@@ -184,16 +198,16 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     sse.send('trace', { step: s, tool, input, ok: outcome.ok, ms, reason: outcome.reason, ...(outcome.ok ? {} : { error: outcome.error }) });
   };
 
-  /** A tool signal that dies with the run, or after the per-page timeout. */
-  const toolSignal = () => AbortSignal.any([abort.signal, AbortSignal.timeout(env.fetchTimeoutMs)]);
+  /** A tool signal that dies with the run, or after the per-call timeout. */
+  const toolSignal = (timeoutMs = env.fetchTimeoutMs) => AbortSignal.any([abort.signal, AbortSignal.timeout(timeoutMs)]);
 
-  async function runWebSearch(s: number, raw: unknown): Promise<string> {
+  async function runWebSearch(s: number, raw: unknown): Promise<{ content: string; results: SearchResult[] }> {
     const t0 = Date.now();
     const parsed = WebSearchInput.safeParse(raw);
     if (!parsed.success) {
       const error = `invalid input: ${parsed.error.issues[0]?.message ?? 'bad query'}`;
       trace(s, 'web_search', asInput(raw), t0, { ok: false, reason: 'rejected before searching', error });
-      return `Error: ${error}`;
+      return { content: `Error: ${error}`, results: [] };
     }
     const { query, reason } = parsed.data;
     searchQueries.push(query);
@@ -213,13 +227,18 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       ok: true,
       reason: `${reason ?? 'search'} → ${results.length ? `${results.length} results` : 'no results'}`
     });
-    if (!results.length) return 'No results.';
-    return results
+    if (!results.length) return { content: 'No results.', results };
+    const content = results
       .map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet.replace(/\s+/g, ' ').slice(0, 300)}`)
       .join('\n');
+    return { content, results };
   }
 
-  async function runFetchPage(s: number, raw: unknown): Promise<{ content: string; isError: boolean }> {
+  async function runFetchPage(
+    s: number,
+    raw: unknown,
+    timeoutMs = env.fetchTimeoutMs
+  ): Promise<{ content: string; isError: boolean }> {
     const t0 = Date.now();
     const parsed = FetchPageInput.safeParse(raw);
     const fail = (input: Record<string, unknown>, reason: string, error: string) => {
@@ -246,11 +265,11 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     fetchAttempts++;
     try {
       if (env.searchProvider === 'tavily') usage.extracts++;
-      ({ text, title: fetchedTitle } = await fetchPage(hit.url, toolSignal()));
+      ({ text, title: fetchedTitle } = await fetchPage(hit.url, toolSignal(timeoutMs)));
     } catch (err) {
       if (abort.signal.aborted) throw err;
       const timedOut = err instanceof DOMException && err.name === 'TimeoutError';
-      const error = timedOut ? `timed out after ${env.fetchTimeoutMs}ms` : err instanceof FetchError ? err.message : (err as Error).message;
+      const error = timedOut ? `timed out after ${timeoutMs}ms` : err instanceof FetchError ? err.message : (err as Error).message;
       return fail({ url }, reason, error || 'fetch failed');
     }
 
@@ -289,7 +308,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
           return result(`Error: not run, the tool-call cap of ${env.maxToolCalls} is reached.`, true);
         }
         const s = ++step;
-        if (tu.name === 'web_search') return result(await runWebSearch(s, tu.input));
+        if (tu.name === 'web_search') return result((await runWebSearch(s, tu.input)).content);
         const r = await runFetchPage(s, tu.input);
         return result(r.content, r.isError);
       })
@@ -299,25 +318,21 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   // ---------------------------------------------------------------- one model turn
 
   /**
-   * One model turn, in one of three modes:
-   *   search  the first turn. web_search is forced, so no answer can be written before
-   *           anything was retrieved. Forcing a tool needs thinking off, and there is
-   *           nothing to reason about yet beyond the query.
+   * One model turn, in one of two modes:
    *   auto    the model picks: more tools, or the answer.
    *   answer  tools are off. Used when the budget is spent or for the snippet fallback.
    *
    * `held` is text from a turn that ended with nothing citable, for the caller to decide on.
    */
-  async function turn(mode: 'search' | 'auto' | 'answer'): Promise<{ msg: Anthropic.Message; held: string }> {
+  async function turn(mode: 'auto' | 'answer'): Promise<{ msg: Anthropic.Message; held: string }> {
     const stream = llm().messages.stream(
       {
         model: env.llmModel,
         max_tokens: MAX_TOKENS_PER_TURN,
         system: systemPrompt(),
         tools: QUICK_TOOLS,
-        ...(mode === 'search'
-          ? { tool_choice: { type: 'tool', name: 'web_search' }, thinking: { type: 'disabled' } }
-          : { tool_choice: { type: mode === 'answer' ? 'none' : 'auto' }, thinking: { type: 'adaptive' } }),
+        tool_choice: { type: mode === 'answer' ? 'none' : 'auto' },
+        thinking: { type: 'adaptive' },
         output_config: { effort: 'low' },
         messages
       },
@@ -326,21 +341,32 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     const forceAnswer = mode === 'answer';
 
     // Text is committed to the client only once it can only be the answer: when tools are
-    // off, or when there are pages to cite and no tool call has appeared in this turn.
-    // Otherwise it is held, and discarded if the turn turns out to be a tool call.
+    // off, or when there are pages to cite, no tool call has appeared in this turn, and the
+    // text already cites or is too long to be a preamble. Otherwise it is held, and
+    // discarded if the turn turns out to be a tool call.
     let held = '';
     let sawToolUse = false;
     for await (const ev of stream) {
       if (ev.type === 'content_block_start' && ev.content_block.type === 'tool_use') sawToolUse = true;
       if (ev.type !== 'content_block_delta' || ev.delta.type !== 'text_delta') continue;
       if (sources) write(ev.delta.text);
-      else if (!sawToolUse && (forceAnswer || pages.length > 0)) {
-        beginAnswer(pageSources());
-        write(held + ev.delta.text);
-        held = '';
-      } else held += ev.delta.text;
+      else {
+        held += ev.delta.text;
+        const answering = forceAnswer || /\[\d/.test(held) || held.length >= COMMIT_AFTER_CHARS;
+        if (!sawToolUse && (forceAnswer || pages.length > 0) && answering) {
+          beginAnswer(pageSources());
+          write(held);
+          held = '';
+        }
+      }
     }
     const msg = await stream.finalMessage();
+    // A short answer that never reached the threshold is still an answer if no tool followed.
+    if (!sources && held && pages.length > 0 && !msg.content.some((b) => b.type === 'tool_use')) {
+      beginAnswer(pageSources());
+      write(held);
+      held = '';
+    }
     usage.in += msg.usage.input_tokens + (msg.usage.cache_creation_input_tokens ?? 0) + (msg.usage.cache_read_input_tokens ?? 0);
     usage.out += msg.usage.output_tokens;
     if (msg.stop_reason === 'refusal') throw new ModelRefusal('llm provider: the model declined to answer (refusal)');
@@ -351,8 +377,31 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
 
   let terminated: Terminated = 'done';
   try {
-    let mode: 'search' | 'auto' | 'answer' = 'search';
-    let nudged = false;
+    // ---- step one, no model: search the question as asked, read the top results.
+    const first = await runWebSearch(++step, { query: ask.query.slice(0, 400), reason: 'the question as asked' });
+    const top = first.results.slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
+    // ++step runs synchronously per result, so steps are numbered in rank order.
+    const reads = await Promise.all(
+      top.map((r) => runFetchPage(++step, { url: r.url, reason: 'top result, read up front' }, env.prefetchTimeoutMs))
+    );
+    const read = reads.filter((r) => !r.isError).map((r) => r.content);
+    const unread = top.flatMap((r, i) => (reads[i]?.isError ? [`${r.url} (${reads[i]!.content.replace(/^Error: /, '')})`] : []));
+    messages.push({
+      role: 'user',
+      content: [
+        ask.query,
+        '---',
+        `The question was searched as asked (${step} of ${env.maxToolCalls} tool calls used, ${Math.max(0, env.maxToolCalls - step)} left).`,
+        `Search results:\n${first.content}`,
+        read.length ? `Pages read, cite them by their source number:\n\n${read.join('\n\n---\n\n')}` : '',
+        unread.length ? `Not read in time (fetch_page can retry with a longer timeout):\n${unread.join('\n')}` : '',
+        'If the pages answer the question, answer now. If not, search again or read more results.'
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+    });
+
+    let mode: 'auto' | 'answer' = 'auto';
     for (;;) {
       const { msg, held } = await turn(mode);
       if (sources) {
@@ -382,17 +431,6 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       }
 
       // The model answered with nothing citable in hand.
-      if (searchResults.size && !fetchAttempts && !nudged && step < env.maxToolCalls) {
-        // It tried to answer from search snippets without reading a page. Once, send it back.
-        nudged = true;
-        log.info({ requestId: ask.requestId }, 'model answered without reading a page; asked it to fetch');
-        messages.push({ role: 'assistant', content: msg.content });
-        messages.push({
-          role: 'user',
-          content: 'Read the most relevant results with fetch_page before answering: only pages you read can be cited.'
-        });
-        continue;
-      }
       if (searchResults.size && !snippetFallback) {
         // Every page read failed, or the cap left no call to read one with. Answer from
         // the search snippets, numbered as sources. Out of calls is a cap, not a finish.

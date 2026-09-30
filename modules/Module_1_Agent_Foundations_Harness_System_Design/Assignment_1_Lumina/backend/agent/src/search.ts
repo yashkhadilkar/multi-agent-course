@@ -59,8 +59,25 @@ async function tavily(path: string, body: Record<string, unknown>, signal: Abort
   return res.json();
 }
 
+/**
+ * Everything that affects Tavily's latency is pinned rather than left to its defaults:
+ * basic depth, no generated answer, no raw page content (fetch_page reads pages), no
+ * images, and no auto_parameters (which may pick a slower depth by itself). Measured:
+ * Tavily's own response_time is 0.8-2.5 s for basic search and the network adds ~0.3 s;
+ * nothing else in this call is ours to trim.
+ */
+const TAVILY_SEARCH = {
+  search_depth: 'basic',
+  topic: 'general',
+  max_results: MAX_RESULTS,
+  include_answer: false,
+  include_raw_content: false,
+  include_images: false,
+  auto_parameters: false
+} as const;
+
 async function tavilySearch(query: string, signal: AbortSignal): Promise<SearchResult[]> {
-  const json = (await tavily('/search', { query, max_results: MAX_RESULTS, search_depth: 'basic' }, signal)) as {
+  const json = (await tavily('/search', { query, ...TAVILY_SEARCH }, signal)) as {
     results?: { title?: string; url?: string; content?: string }[];
   };
   return (json.results ?? []).flatMap((r) =>
