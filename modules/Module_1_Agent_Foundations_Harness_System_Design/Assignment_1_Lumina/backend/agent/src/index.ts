@@ -39,10 +39,11 @@
 import express from 'express';
 import pino from 'pino';
 import { mkdirSync } from 'node:fs';
-import { AskBody, HealthResponse, REQUEST_HEADER, ROUTES, ThreadId, USER_HEADER, newId } from '@lumina/contract';
+import { AskBody, CreateThreadBody, HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER, newId } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
 import { runQuick } from './quick.js';
+import { beginTurn, createThread, findThread, getThread, listThreads, saveAnswer } from './threads.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -55,6 +56,43 @@ app.use((req, res, next) =>
 );
 
 mkdirSync(env.runsDir, { recursive: true });
+
+// ---------------------------------------------------------------- request id + X-User-Id
+
+type Locals = { requestId: string; userId: string };
+
+const PUBLIC_PATHS = new Set(['/health', '/evals/report.json']);
+
+app.use((req, res, next) => {
+  // Reuse the gateway's id so one request greps end to end; mint one when called directly.
+  const requestId = req.header(REQUEST_HEADER) || newId('req');
+  res.locals.requestId = requestId;
+  res.setHeader(REQUEST_HEADER, requestId);
+  if (PUBLIC_PATHS.has(req.path)) return next();
+  // Checked here as well as at the gateway: the user id is what scopes every thread read.
+  const userId = req.header(USER_HEADER);
+  if (!userId) return void res.status(401).json({ error: 'X-User-Id header is required', status: 401, requestId });
+  res.locals.userId = userId;
+  next();
+});
+
+const reject = (res: express.Response, status: number, error: string) =>
+  res.status(status).json({ error, status, requestId: (res.locals as Locals).requestId });
+
+/**
+ * Express 4 does not catch a rejected promise. A store that throws is an upstream failure:
+ * 502, logged. The driver's message stays in the log, since it can name the cluster host.
+ */
+const handle =
+  (what: string, fn: (req: express.Request, res: express.Response, locals: Locals) => Promise<unknown>) =>
+  (req: express.Request, res: express.Response) => {
+    const locals = res.locals as Locals;
+    fn(req, res, locals).catch((err: unknown) => {
+      log.error({ requestId: locals.requestId, err }, `${what} failed`);
+      if (!res.headersSent) reject(res, 502, `${what} failed`);
+      else if (!res.writableEnded) res.end();
+    });
+  };
 
 // ---------------------------------------------------------------- /health (implemented)
 
@@ -76,33 +114,72 @@ app.get('/health', async (_req, res) => {
   res.status(ping.status === 'ok' ? 200 : 503).json(body);
 });
 
+// ---------------------------------------------------------------- threads
+
+const badBody = (error: { issues: { path: (string | number)[]; message: string }[] }) => {
+  const issue = error.issues[0];
+  return issue ? `${issue.path.join('.') || 'body'}: ${issue.message}` : 'invalid body';
+};
+
+app.post(
+  '/threads',
+  handle('creating the thread', async (req, res, { userId }) => {
+    const parsed = CreateThreadBody.safeParse(req.body ?? {});
+    if (!parsed.success) return reject(res, 400, badBody(parsed.error));
+    res.status(201).json({ threadId: await createThread(userId, parsed.data.title) });
+  })
+);
+
+app.get(
+  '/threads',
+  handle('listing threads', async (_req, res, { userId }) => {
+    res.json(await listThreads(userId));
+  })
+);
+
+// Another user's thread is a 404, not a 403: a 403 would confirm that it exists.
+app.get(
+  '/threads/:threadId',
+  handle('loading the thread', async (req, res, { userId }) => {
+    const thread = await getThread(userId, req.params.threadId!);
+    if (!thread) return reject(res, 404, `unknown thread ${req.params.threadId}`);
+    res.json(thread);
+  })
+);
+
 // ---------------------------------------------------------------- POST /threads/:threadId/ask
 
-app.post('/threads/:threadId/ask', async (req, res) => {
-  // Reuse the gateway's id so one request greps end to end; mint one when called directly.
-  const requestId = req.header(REQUEST_HEADER) || newId('req');
-  res.setHeader(REQUEST_HEADER, requestId);
-  const reject = (status: number, error: string) => res.status(status).json({ error, status, requestId });
+app.post(
+  '/threads/:threadId/ask',
+  handle('starting the answer', async (req, res, { requestId, userId }) => {
+    const { threadId } = req.params as { threadId: string };
+    const parsed = AskBody.safeParse(req.body ?? {});
+    if (!parsed.success) return reject(res, 400, badBody(parsed.error));
+    const ask = parsed.data;
 
-  const userId = req.header(USER_HEADER);
-  if (!userId) return reject(401, 'X-User-Id header is required');
-  // No threads collection yet, so any well-formed id is accepted. A malformed one cannot
-  // name a thread that exists.
-  if (!ThreadId.safeParse(req.params.threadId).success) return reject(404, `unknown thread ${req.params.threadId}`);
+    // Everything that can be known up front is a real status, before the first byte of the stream.
+    if (!(await findThread(userId, threadId))) return reject(res, 404, `unknown thread ${threadId}`);
+    // Deep is refused rather than quietly run as quick: the server reports the gear it ran,
+    // and it never changes the one the client asked for.
+    if (ask.depth === 'deep') return reject(res, 501, 'not implemented yet: depth "deep"');
+    if (ask.mode === 'docs' || ask.spaceId) return reject(res, 501, 'not implemented yet: document search (mode "docs" / spaceId)');
 
-  const parsed = AskBody.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    return reject(400, issue ? `${issue.path.join('.') || 'body'}: ${issue.message}` : 'invalid body');
-  }
-  const ask = parsed.data;
-  // Deep is refused rather than quietly run as quick: the server reports the gear it ran,
-  // and it never changes the one the client asked for.
-  if (ask.depth === 'deep') return reject(501, 'not implemented yet: depth "deep"');
-  if (ask.mode === 'docs' || ask.spaceId) return reject(501, 'not implemented yet: document search (mode "docs" / spaceId)');
-
-  await runQuick({ requestId, userId, threadId: req.params.threadId, query: ask.query }, res, log);
-});
+    // The question is saved whatever the run's outcome; the answer only if it ends done or cap.
+    const { questionId, history } = await beginTurn(userId, threadId, ask.query);
+    await runQuick(
+      {
+        requestId,
+        userId,
+        threadId,
+        query: ask.query,
+        history,
+        saveAnswer: (answer) => saveAnswer(userId, threadId, questionId, answer)
+      },
+      res,
+      log
+    );
+  })
+);
 
 // ---------------------------------------------------------------- everything else: 501
 
@@ -110,7 +187,14 @@ const notImplemented = (route: string) => (_req: express.Request, res: express.R
   res.status(501).json({ error: `not implemented yet: ${route}. Build it in backend/agent/src/.`, status: 501 });
 };
 
-const IMPLEMENTED = new Set(['GET /health', 'GET /evals/report.json', 'POST /threads/:threadId/ask']);
+const IMPLEMENTED = new Set([
+  'GET /health',
+  'GET /evals/report.json',
+  'POST /threads',
+  'GET /threads',
+  'GET /threads/:threadId',
+  'POST /threads/:threadId/ask'
+]);
 
 for (const route of ROUTES) {
   if (IMPLEMENTED.has(`${route.method} ${route.path}`)) continue;

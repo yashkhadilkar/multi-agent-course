@@ -27,12 +27,13 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { Response } from 'express';
 import type { Logger } from 'pino';
 import { z } from 'zod';
-import { newId, type RunLog, type Source, type Terminated, type ToolName } from '@lumina/contract';
+import { newId, type DoneEvent, type RunLog, type Source, type Terminated, type ToolName } from '@lumina/contract';
 import { cachedSearch, isTimeSensitive } from './cache.js';
 import { env, secrets } from './env.js';
 import { selectPassages } from './passages.js';
 import { FetchError, SearchProviderError, fetchPage, hostOf, type SearchResult } from './search.js';
 import { CitationFilter, SseStream } from './sse.js';
+import type { SavedAnswer } from './threads.js';
 
 /** Words of each fetched page the model reads. Four pages of this stay well inside quick's cost budget. */
 const PAGE_WORDS = 700;
@@ -108,7 +109,11 @@ How to answer:
 - Put the direct answer in the first sentence, then only what the question needs. Keep it under about 150 words unless the question asks for depth; no headings for a short answer.
 - Each page you read has a source number. Cite a claim by putting that number in square brackets right after it, like this [2]. One number per bracket: [1][3], never [1, 3].
 - Cite only the source numbers given with the pages you read. Search results are not sources.
-- Make claims only from the passages you read. If they do not answer the question, say that plainly instead of guessing.`;
+- Make claims only from the passages you read. If they do not answer the question, say that plainly instead of guessing.
+
+Earlier turns:
+- If this is a follow-up, the conversation so far comes before the question. Use it to work out what the question refers to.
+- Earlier answers had their citation numbers removed, and the pages behind them cannot be cited now. Cite only pages read for this question.`;
 }
 
 let anthropic: Anthropic | null = null;
@@ -116,7 +121,16 @@ const llm = () => (anthropic ??= new Anthropic({ apiKey: secrets.anthropic, maxR
 
 // ---------------------------------------------------------------- the run
 
-export type QuickAsk = { requestId: string; userId: string; threadId: string; query: string };
+export type QuickAsk = {
+  requestId: string;
+  userId: string;
+  threadId: string;
+  query: string;
+  /** Earlier turns of the thread, already trimmed, as alternating user/assistant messages. */
+  history: Anthropic.MessageParam[];
+  /** Persists a done or capped answer. Runs before `done` is sent; a throw ends the run as an error. */
+  saveAnswer: (answer: SavedAnswer) => Promise<void>;
+};
 
 type Page = { n: number; url: string; title: string; snippet: string };
 
@@ -144,8 +158,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     if (!res.writableFinished) abort.abort(new ClientGone('client disconnected'));
   });
 
-  // The first message is built from the up-front search and reads, before the first turn.
-  const messages: Anthropic.MessageParam[] = [];
+  // The thread so far, then the question's message, built from the up-front search and reads.
+  const messages: Anthropic.MessageParam[] = [...ask.history];
   const searchResults = new Map<string, SearchResult>(); // normalized url → first result that named it
   const searchQueries: string[] = [];
   const pages: Page[] = [];
@@ -164,7 +178,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   let sources = null as Source[] | null;
   let filter = null as CitationFilter | null;
   let ttftMs = null as number | null;
-  let answerChars = 0;
+  /** Exactly what the client was sent, which is what the thread saves. */
+  let answerText = '';
 
   // ---------------------------------------------------------------- answer output
 
@@ -182,7 +197,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   const emit = (text: string) => {
     if (!text) return;
     ttftMs ??= Date.now() - started;
-    answerChars += text.length;
+    answerText += text;
     sse.send('token', { text });
   };
   const write = (delta: string) => emit(filter!.push(delta));
@@ -415,6 +430,10 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         `Search results:\n${first.content}`,
         read.length ? `Pages read, cite them by their source number:\n\n${read.join('\n\n---\n\n')}` : '',
         unread.length ? `Not read in time (fetch_page can retry with a longer timeout):\n${unread.join('\n')}` : '',
+        // The up-front search had only the follow-up's own words, which may not name what it is about.
+        ask.history.length
+          ? 'This is a follow-up. If these results miss what it refers to in the conversation, search again with that spelled out.'
+          : '',
         'If the pages answer the question, answer now. If not, search again or read more results.'
       ]
         .filter(Boolean)
@@ -487,7 +506,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       capped = true;
       beginAnswer(sources ?? pageSources());
       emit(filter?.flush() ?? '');
-      emit(`${answerChars ? '\n\n' : ''}The search stopped at its ${env.maxWallClockSec} s limit before the answer was finished.`);
+      emit(`${answerText ? '\n\n' : ''}The search stopped at its ${env.maxWallClockSec} s limit before the answer was finished.`);
     } else {
       terminated = 'error';
       const gone = reason instanceof ClientGone;
@@ -509,20 +528,33 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   }
 
   clearTimeout(hardStop);
-  const done = finish();
+  const done = measure();
+  // Saved before `done` goes out: an answer the thread lost would be invisible to the next
+  // follow-up, so a failed save ends the run as an error instead of a quiet success.
+  try {
+    await ask.saveAnswer({ answerId, content: answerText, sources: sources ?? [], done });
+  } catch (err) {
+    terminated = 'error';
+    const message = 'saving the answer to the thread failed';
+    finish({ error: `${message}: ${(err as Error).message}` });
+    log.error({ requestId: ask.requestId, err }, message);
+    sse.fail(502, message, ask.requestId);
+    return;
+  }
+  finish({}, done);
   sse.send('done', done);
   sse.end();
 
   // ---------------------------------------------------------------- accounting
 
-  function finish(extra: { error?: string } = {}) {
+  function measure(): DoneEvent {
     const latencyMs = Date.now() - started;
     const costUsd =
       (usage.in * env.llmInputUsdPerMtok + usage.out * env.llmOutputUsdPerMtok) / 1e6 +
       usage.searches * env.searchUsdPerCall +
       // Tavily bills extract at one credit per five pages, a fifth of a search.
       usage.extracts * (env.searchUsdPerCall / 5);
-    const done = {
+    return {
       answerId,
       latencyMs,
       ttftMs: ttftMs ?? latencyMs,
@@ -532,9 +564,13 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       // Only when every search in the request hit. No search at all is not a hit.
       searchCached: cache.searches > 0 && cache.hits === cache.searches,
       terminated,
-      depth: 'quick' as const,
+      depth: 'quick',
       subQuestions: 0
     };
+  }
+
+  function finish(extra: { error?: string } = {}, done = measure()) {
+    const { latencyMs } = done;
     // The run log in the quality kit's shape. Persisting it is the next step; for now it
     // rides on the answer's log line.
     const runLog: RunLog = {
