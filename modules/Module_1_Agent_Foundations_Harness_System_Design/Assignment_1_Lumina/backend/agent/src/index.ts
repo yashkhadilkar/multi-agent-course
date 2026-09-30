@@ -39,9 +39,10 @@
 import express from 'express';
 import pino from 'pino';
 import { mkdirSync } from 'node:fs';
-import { HealthResponse, ROUTES } from '@lumina/contract';
+import { AskBody, HealthResponse, REQUEST_HEADER, ROUTES, ThreadId, USER_HEADER, newId } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
+import { runQuick } from './quick.js';
 
 const log = pino({ level: env.logLevel });
 const app = express();
@@ -75,21 +76,56 @@ app.get('/health', async (_req, res) => {
   res.status(ping.status === 'ok' ? 200 : 503).json(body);
 });
 
+// ---------------------------------------------------------------- POST /threads/:threadId/ask
+
+app.post('/threads/:threadId/ask', async (req, res) => {
+  // Reuse the gateway's id so one request greps end to end; mint one when called directly.
+  const requestId = req.header(REQUEST_HEADER) || newId('req');
+  res.setHeader(REQUEST_HEADER, requestId);
+  const reject = (status: number, error: string) => res.status(status).json({ error, status, requestId });
+
+  const userId = req.header(USER_HEADER);
+  if (!userId) return reject(401, 'X-User-Id header is required');
+  // No threads collection yet, so any well-formed id is accepted. A malformed one cannot
+  // name a thread that exists.
+  if (!ThreadId.safeParse(req.params.threadId).success) return reject(404, `unknown thread ${req.params.threadId}`);
+
+  const parsed = AskBody.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    return reject(400, issue ? `${issue.path.join('.') || 'body'}: ${issue.message}` : 'invalid body');
+  }
+  const ask = parsed.data;
+  // Deep is refused rather than quietly run as quick: the server reports the gear it ran,
+  // and it never changes the one the client asked for.
+  if (ask.depth === 'deep') return reject(501, 'not implemented yet: depth "deep"');
+  if (ask.mode === 'docs' || ask.spaceId) return reject(501, 'not implemented yet: document search (mode "docs" / spaceId)');
+
+  await runQuick({ requestId, userId, threadId: req.params.threadId, query: ask.query }, res, log);
+});
+
 // ---------------------------------------------------------------- everything else: 501
 
 const notImplemented = (route: string) => (_req: express.Request, res: express.Response) => {
   res.status(501).json({ error: `not implemented yet: ${route}. Build it in backend/agent/src/.`, status: 501 });
 };
 
+const IMPLEMENTED = new Set(['GET /health', 'GET /evals/report.json', 'POST /threads/:threadId/ask']);
+
 for (const route of ROUTES) {
-  if (route.path === '/health' || route.path === '/evals/report.json') continue;
+  if (IMPLEMENTED.has(`${route.method} ${route.path}`)) continue;
   const method = route.method.toLowerCase() as 'get' | 'post' | 'delete';
   app[method](route.path, notImplemented(`${route.method} ${route.path}`));
 }
 
 app.use((req, res) => res.status(404).json({ error: `no route ${req.method} ${req.path}`, status: 404 }));
 
-app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((err: Error & { type?: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  // A body that is not JSON is the client's mistake, not an upstream failure.
+  if (err.type === 'entity.parse.failed') {
+    res.status(400).json({ error: 'body is not valid JSON', status: 400 });
+    return;
+  }
   log.error({ err }, 'agent error');
   res.status(502).json({ error: err.message, status: 502 });
 });

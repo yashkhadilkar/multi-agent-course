@@ -38,6 +38,15 @@ export const env = {
   searchProvider: oneOf('SEARCH_PROVIDER', SEARCH_PROVIDERS, 'tavily'),
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
 
+  /** A single page read gives up after this; one slow publisher must not eat the budget. */
+  fetchTimeoutMs: num(process.env.FETCH_TIMEOUT_MS, 10000),
+
+  // Prices behind done.costUsd. The defaults are the declared table in
+  // benchmark/sla.json (cost_model), so the agent and the bench price a run the same way.
+  llmInputUsdPerMtok: num(process.env.LLM_INPUT_USD_PER_MTOK, 3.0),
+  llmOutputUsdPerMtok: num(process.env.LLM_OUTPUT_USD_PER_MTOK, 15.0),
+  searchUsdPerCall: num(process.env.SEARCH_USD_PER_CALL, 0.008),
+
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
 
   // Deep search is the expensive gear, so its limits are configuration, not code.
