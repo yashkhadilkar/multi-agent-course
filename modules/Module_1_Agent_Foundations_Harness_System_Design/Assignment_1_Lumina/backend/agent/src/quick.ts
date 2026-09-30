@@ -19,6 +19,10 @@
  * model's first turn already has those pages, so a simple question is answered in one
  * LLM call; a harder one can still search and read more, inside the same caps.
  *
+ * recall_memory runs in that same step, in parallel with the search, on every ask: the
+ * user's saved preferences reach the model whether or not it would have thought to look.
+ * save_memory is the model's to call, and only when the user states something durable.
+ *
  * The final answer is the model's last turn, streamed as it is written. Text the model
  * writes before a tool call (a preamble) is held back until the turn shows whether it is
  * an answer, and discarded if it is not.
@@ -30,6 +34,7 @@ import { z } from 'zod';
 import { newId, type DoneEvent, type RunLog, type Source, type Terminated, type ToolName } from '@lumina/contract';
 import { cachedSearch, isTimeSensitive } from './cache.js';
 import { env, secrets } from './env.js';
+import { MAX_MEMORY_CHARS, recallMemories, saveMemory, type RecalledMemory } from './memory.js';
 import { selectPassages } from './passages.js';
 import { FetchError, SearchProviderError, fetchPage, hostOf, type SearchResult } from './search.js';
 import { CitationFilter, SseStream } from './sse.js';
@@ -87,6 +92,26 @@ const QUICK_TOOLS: Anthropic.Tool[] = [
       additionalProperties: false
     },
     eager_input_streaming: true
+  },
+  {
+    name: 'save_memory',
+    description:
+      'Remember a stable preference or fact the user has stated about themselves, for all their future ' +
+      'conversations. Only for what they said about themselves (how they want answers, what they work with, ' +
+      'who they are), never for facts from search results or one-off details of this question. A memory that ' +
+      'restates one already saved is not saved again.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          description: 'One short standalone sentence about the user, e.g. "Prefers code examples in TypeScript."'
+        },
+        reason: { type: 'string', description: 'A short phrase: why this is worth remembering.' }
+      },
+      required: ['text'],
+      additionalProperties: false
+    }
   }
 ];
 const QUICK_TOOL_NAMES = new Set(QUICK_TOOLS.map((t) => t.name));
@@ -94,6 +119,7 @@ const QUICK_TOOL_NAMES = new Set(QUICK_TOOLS.map((t) => t.name));
 // With eager input streaming the API no longer validates tool inputs, so we do.
 const WebSearchInput = z.object({ query: z.string().trim().min(1).max(400), reason: z.string().optional() });
 const FetchPageInput = z.object({ url: z.string().url(), reason: z.string().optional() });
+const SaveMemoryInput = z.object({ text: z.string().trim().min(1).max(MAX_MEMORY_CHARS), reason: z.string().optional() });
 
 function systemPrompt(): string {
   const today = new Date().toISOString().slice(0, 10);
@@ -104,6 +130,10 @@ How to research:
 - If those passages answer the question, answer straight away. If not, use web_search and fetch_page to look further. Make independent calls in parallel, in the same turn.
 - A run has at most ${env.maxToolCalls} tool calls, including the ones already made for you; the question says how many are left.
 - Write no text before or between tool calls. The only text you write is the final answer.
+
+Memory:
+- What you know about the user from earlier conversations comes with the question, under "About this user". Follow their stated preferences in your answer. Memories are not sources: never cite them.
+- When the user states a lasting preference or fact about themselves ("remember that…", "I always want…", "I work in…"), call save_memory with it as one short sentence, then briefly confirm. Do not save facts from pages, or details that only matter for this one question.
 
 How to answer:
 - Put the direct answer in the first sentence, then only what the question needs. Keep it under about 150 words unless the question asks for depth; no headings for a short answer.
@@ -146,6 +176,14 @@ const asInput = (raw: unknown): Record<string, unknown> =>
   raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
 
 const normUrl = (u: string) => u.replace(/#.*$/, '').replace(/\/+$/, '');
+
+/** The recalled memories as the model sees them, most relevant first. Empty when there are none. */
+function memoryNote({ memories, error }: { memories: RecalledMemory[]; error?: string }): string {
+  if (error) return 'About this user: saved memories could not be loaded for this question.';
+  if (!memories.length) return '';
+  const lines = memories.map((m) => `- ${m.text} (saved ${m.createdAt.toISOString().slice(0, 10)})`);
+  return `About this user (from earlier conversations; follow these preferences, and where two disagree the newer wins; not citable):\n${lines.join('\n')}`;
+}
 
 // ---------------------------------------------------------------- follow-ups
 
@@ -366,6 +404,53 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     };
   }
 
+  /** Always the run's first step. A failure is a failed step, not a failed run: the answer goes on without memory, and says so in the trace. */
+  async function runRecall(s: number, query: string): Promise<{ memories: RecalledMemory[]; error?: string }> {
+    const t0 = Date.now();
+    try {
+      const memories = await recallMemories(ask.userId, query, toolSignal());
+      trace(s, 'recall_memory', { query }, t0, {
+        ok: true,
+        reason: memories.length
+          ? `${memories.length} memor${memories.length === 1 ? 'y' : 'ies'}: ${memories.map((m) => m.id).join(', ')}`
+          : 'no saved memories'
+      });
+      return { memories };
+    } catch (err) {
+      if (abort.signal.aborted) throw err;
+      const error = (err as Error).message || 'recall failed';
+      log.error({ requestId: ask.requestId, err }, 'recall_memory failed; answering without memory');
+      trace(s, 'recall_memory', { query }, t0, { ok: false, reason: 'answering without saved memories', error });
+      return { memories: [], error };
+    }
+  }
+
+  async function runSaveMemory(s: number, raw: unknown): Promise<{ content: string; isError: boolean }> {
+    const t0 = Date.now();
+    const parsed = SaveMemoryInput.safeParse(raw);
+    if (!parsed.success) {
+      const error = `invalid input: ${parsed.error.issues[0]?.message ?? 'bad text'}`;
+      trace(s, 'save_memory', asInput(raw), t0, { ok: false, reason: 'rejected before saving', error });
+      return { content: `Error: ${error}`, isError: true };
+    }
+    const { text, reason = 'remember' } = parsed.data;
+    try {
+      const r = await saveMemory(ask.userId, text, ask.threadId, toolSignal());
+      if (r.saved) {
+        trace(s, 'save_memory', { text }, t0, { ok: true, reason: `${reason} → saved as ${r.id}` });
+        return { content: `Saved (${r.id}). It applies to this user's future conversations.`, isError: false };
+      }
+      trace(s, 'save_memory', { text }, t0, { ok: true, reason: `${reason} → already remembered as ${r.duplicateOf.id}, not saved again` });
+      return { content: `Already remembered: "${r.duplicateOf.text}". Nothing new was saved.`, isError: false };
+    } catch (err) {
+      if (abort.signal.aborted) throw err;
+      const error = (err as Error).message || 'save failed';
+      log.error({ requestId: ask.requestId, err }, 'save_memory failed');
+      trace(s, 'save_memory', { text }, t0, { ok: false, reason, error });
+      return { content: `Error: ${error}. Nothing was saved; tell the user it could not be remembered.`, isError: true };
+    }
+  }
+
   /** Runs one turn's tool calls in parallel. Slots are reserved in the model's order, before any await. */
   async function runTools(uses: Anthropic.ToolUseBlock[]): Promise<Anthropic.ToolResultBlockParam[]> {
     return Promise.all(
@@ -386,7 +471,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         }
         const s = ++step;
         if (tu.name === 'web_search') return result((await runWebSearch(s, tu.input)).content);
-        const r = await runFetchPage(s, tu.input);
+        const r = tu.name === 'save_memory' ? await runSaveMemory(s, tu.input) : await runFetchPage(s, tu.input);
         return result(r.content, r.isError);
       })
     );
@@ -456,11 +541,16 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   try {
     // ---- step one, no model: search the question as asked, read the top results. A
     // follow-up that points back ("does it…") is searched with the question before it.
+    // Recall runs alongside it: neither needs the other, so it costs no time to first token.
     const withContext = firstSearchQuery(ask);
-    const first = await runWebSearch(++step, {
-      query: withContext ?? ask.query.slice(0, 400),
-      reason: withContext ? 'the follow-up, with the earlier question it refers back to' : 'the question as asked'
-    });
+    const recallStep = ++step;
+    const [recalled, first] = await Promise.all([
+      runRecall(recallStep, withContext ?? ask.query),
+      runWebSearch(++step, {
+        query: withContext ?? ask.query.slice(0, 400),
+        reason: withContext ? 'the follow-up, with the earlier question it refers back to' : 'the question as asked'
+      })
+    ]);
     const top = first.results.slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
     // ++step runs synchronously per result, so steps are numbered in rank order.
     const reads = await Promise.all(
@@ -473,6 +563,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       content: [
         ask.query,
         '---',
+        memoryNote(recalled),
         `The question was searched ${withContext ? 'together with the earlier question it refers back to' : 'as asked'} (${step} of ${env.maxToolCalls} tool calls used, ${Math.max(0, env.maxToolCalls - step)} left).`,
         `Search results:\n${first.content}`,
         read.length ? `Pages read, cite them by their source number:\n\n${read.join('\n\n---\n\n')}` : '',

@@ -42,6 +42,7 @@ import { mkdirSync } from 'node:fs';
 import { AskBody, CreateThreadBody, HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER, newId } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
+import { deleteMemory, listMemories } from './memory.js';
 import { runQuick } from './quick.js';
 import { beginTurn, createThread, findThread, getThread, listThreads, saveAnswer } from './threads.js';
 
@@ -182,6 +183,24 @@ app.post(
   })
 );
 
+// ---------------------------------------------------------------- memory
+
+app.get(
+  '/memory',
+  handle('listing memories', async (_req, res, { userId }) => {
+    res.json(await listMemories(userId));
+  })
+);
+
+// Another user's memory is a 404 too: its id says nothing about whether it exists.
+app.delete(
+  '/memory/:memoryId',
+  handle('deleting the memory', async (req, res, { userId }) => {
+    if (!(await deleteMemory(userId, req.params.memoryId!))) return reject(res, 404, `unknown memory ${req.params.memoryId}`);
+    res.status(204).end();
+  })
+);
+
 // ---------------------------------------------------------------- everything else: 501
 
 const notImplemented = (route: string) => (_req: express.Request, res: express.Response) => {
@@ -194,7 +213,9 @@ const IMPLEMENTED = new Set([
   'POST /threads',
   'GET /threads',
   'GET /threads/:threadId',
-  'POST /threads/:threadId/ask'
+  'POST /threads/:threadId/ask',
+  'GET /memory',
+  'DELETE /memory/:memoryId'
 ]);
 
 for (const route of ROUTES) {
