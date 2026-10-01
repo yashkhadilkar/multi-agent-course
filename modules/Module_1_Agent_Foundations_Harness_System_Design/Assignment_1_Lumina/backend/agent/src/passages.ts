@@ -81,6 +81,13 @@ function score(passages: string[], query: string[]): Passage[] {
   });
 }
 
+/**
+ * Joins soft line breaks: a single newline inside a paragraph becomes a space, a blank line
+ * stays a paragraph break. Hard-wrapped source (Markdown wrapped at ~90 columns) would
+ * otherwise split into one-line "paragraphs", and a snippet would be a line fragment.
+ */
+export const unwrap = (text: string) => text.replace(/([^\n])\n(?!\s*\n)/g, '$1 ');
+
 export type Selection = {
   /** What the model reads: the best passages, in page order, within the word budget. */
   passages: string[];

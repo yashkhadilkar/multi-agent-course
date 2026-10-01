@@ -64,6 +64,17 @@ export const env = {
   /** How long the read-your-write probe waits for Atlas to make a fresh chunk searchable. */
   probeTimeoutMs: num(process.env.PROBE_TIMEOUT_MS, 90_000),
 
+  // Hybrid retrieval (search_documents): $vectorSearch and BM25 $search, fused by RRF.
+  /** Chunks search_documents returns, after fusion and after unindexed documents are dropped. */
+  ragTopK: num(process.env.RAG_TOP_K, 5),
+  /** RRF's damping constant: score = Σ 1 / (k + rank). 60 is the original paper's value. */
+  ragRrfK: num(process.env.RAG_RRF_K, 60),
+  /**
+   * How many hits each retriever returns before fusion. Over-fetched past top-k so that
+   * chunks of documents not yet `indexed` can be dropped and top-k still filled.
+   */
+  ragCandidates: num(process.env.RAG_CANDIDATES, 20),
+
   // Deep search is the expensive gear, so its limits are configuration, not code.
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
   deepSubQuestionsMax: num(process.env.DEEP_SUB_QUESTIONS_MAX, 6),
@@ -80,6 +91,10 @@ export const env = {
 
   logLevel: process.env.LOG_LEVEL ?? 'info'
 } as const;
+
+if (env.ragTopK < 1 || env.ragCandidates < env.ragTopK || env.ragRrfK < 0) {
+  throw new Error(`RAG_TOP_K (${env.ragTopK}) must be at least 1, RAG_CANDIDATES (${env.ragCandidates}) at least RAG_TOP_K, and RAG_RRF_K (${env.ragRrfK}) not negative`);
+}
 
 // An overlap as long as the chunk never advances; refuse it at boot rather than spin.
 if (env.chunkOverlapChars < 0 || env.chunkOverlapChars >= env.chunkSizeChars) {

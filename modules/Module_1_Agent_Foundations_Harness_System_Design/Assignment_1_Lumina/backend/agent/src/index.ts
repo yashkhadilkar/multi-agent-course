@@ -44,6 +44,7 @@ import { pingDb } from './db.js';
 import { workerHealth, type WorkerHealth } from './jobs.js';
 import { deleteMemory, listMemories } from './memory.js';
 import { runQuick } from './quick.js';
+import { spaceContents, type SpaceContents } from './retrieval.js';
 import { computeStats } from './runlog.js';
 import { addDocument, createSpace, findSpace, listDocuments, listSpaces, receiveUpload } from './spaces.js';
 import { beginTurn, createThread, findThread, getThread, listThreads, saveAnswer } from './threads.js';
@@ -178,13 +179,20 @@ app.post(
     const parsed = AskBody.safeParse(req.body ?? {});
     if (!parsed.success) return reject(res, 400, badBody(parsed.error));
     const ask = parsed.data;
+    if (ask.mode === 'docs' && !ask.spaceId) return reject(res, 400, 'mode "docs" needs a spaceId: there is no Space to search');
 
     // Everything that can be known up front is a real status, before the first byte of the stream.
     if (!(await findThread(userId, threadId))) return reject(res, 404, `unknown thread ${threadId}`);
     // Deep is refused rather than quietly run as quick: the server reports the gear it ran,
     // and it never changes the one the client asked for.
     if (ask.depth === 'deep') return reject(res, 501, 'not implemented yet: depth "deep"');
-    if (ask.mode === 'docs' || ask.spaceId) return reject(res, 501, 'not implemented yet: document search (mode "docs" / spaceId)');
+    // Another user's Space is a 404 here too. Web mode never searches it, so it skips the listing.
+    let space: SpaceContents | null = null;
+    if (ask.spaceId) {
+      const found = await findSpace(userId, ask.spaceId);
+      if (!found) return reject(res, 404, `unknown space ${ask.spaceId}`);
+      if (ask.mode !== 'web') space = await spaceContents(userId, found._id, found.name);
+    }
 
     // The question is saved whatever the run's outcome; the answer only if it ends done or cap.
     const { questionId, history, earlierQuestions } = await beginTurn(userId, threadId, ask.query);
@@ -194,6 +202,8 @@ app.post(
         userId,
         threadId,
         query: ask.query,
+        mode: ask.mode,
+        space,
         history,
         earlierQuestions,
         saveAnswer: (answer) => saveAnswer(userId, threadId, questionId, answer)

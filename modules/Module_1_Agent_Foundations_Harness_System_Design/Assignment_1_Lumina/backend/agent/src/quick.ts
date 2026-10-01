@@ -23,6 +23,12 @@
  * user's saved preferences reach the model whether or not it would have thought to look.
  * save_memory is the model's to call, and only when the user states something durable.
  *
+ * Documents (retrieval.ts): docs mode runs search_documents in place of the first web
+ * search and has no web tools; auto with a Space runs both searches in that first step and
+ * gives the model both toolsets, so it decides; auto without a Space is web only. A chunk
+ * is a source the moment search_documents returns it, numbered in the same sequence as
+ * pages, with its snippet cut from the chunk's own text.
+ *
  * The final answer is the model's last turn, streamed as it is written. Text the model
  * writes before a tool call (a preamble) is held back until the turn shows whether it is
  * an answer, and discarded if it is not.
@@ -31,11 +37,21 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { Response } from 'express';
 import type { Logger } from 'pino';
 import { z } from 'zod';
-import { newId, type DoneEvent, type RunLog, type Source, type Terminated, type ToolName } from '@lumina/contract';
+import {
+  newId,
+  type AskMode,
+  type DoneEvent,
+  type Locator,
+  type RunLog,
+  type Source,
+  type Terminated,
+  type ToolName
+} from '@lumina/contract';
 import { cachedSearch, isTimeSensitive } from './cache.js';
 import { env, secrets } from './env.js';
 import { MAX_MEMORY_CHARS, recallMemories, saveMemory, type RecalledMemory } from './memory.js';
-import { selectPassages } from './passages.js';
+import { selectPassages, unwrap } from './passages.js';
+import { DocumentSearchError, searchDocuments, type SpaceContents } from './retrieval.js';
 import { recordAnswer } from './runlog.js';
 import { FetchError, SearchProviderError, fetchPage, hostOf, type SearchResult } from './search.js';
 import { CitationFilter, SseStream } from './sse.js';
@@ -58,10 +74,11 @@ const COMMIT_AFTER_CHARS = 160;
 // ---------------------------------------------------------------- tools
 
 /**
- * The quick toolbelt. plan_research is not in it, and dispatch below refuses anything not
- * in it: a prompt asking the model not to escalate is a suggestion, this is the gate.
+ * The quick toolbelt, cut down per run to what the mode may search (toolbelt below).
+ * plan_research is never in it, and dispatch refuses anything not in the run's belt: a
+ * prompt asking the model not to escalate is a suggestion, this is the gate.
  */
-const QUICK_TOOLS: Anthropic.Tool[] = [
+const WEB_TOOLS: Anthropic.Tool[] = [
   {
     name: 'web_search',
     description:
@@ -93,7 +110,28 @@ const QUICK_TOOLS: Anthropic.Tool[] = [
       additionalProperties: false
     },
     eager_input_streaming: true
+  }
+];
+
+const SEARCH_DOCUMENTS_TOOL: Anthropic.Tool = {
+  name: 'search_documents',
+  description:
+    "Search the documents in the user's selected Space. Returns the best-matching passages, each with its source " +
+    'number for citing and where it sits in its document (page, heading or line). Only passages this tool returned ' +
+    'can be cited as documents.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'What to look for, in words the documents are likely to use.' },
+      reason: { type: 'string', description: 'A short phrase: why this search.' }
+    },
+    required: ['query'],
+    additionalProperties: false
   },
+  eager_input_streaming: true
+};
+
+const MEMORY_TOOLS: Anthropic.Tool[] = [
   {
     name: 'save_memory',
     description:
@@ -115,20 +153,81 @@ const QUICK_TOOLS: Anthropic.Tool[] = [
     }
   }
 ];
-const QUICK_TOOL_NAMES = new Set(QUICK_TOOLS.map((t) => t.name));
+
+/**
+ * What a run searches (DESIGN.md, Responsibilities): docs mode only the Space; auto with a
+ * Space both, and the model decides which the question needs; everything else the web.
+ */
+export type Retrieval = 'web' | 'docs' | 'both';
+
+export function retrievalFor(mode: AskMode, hasSpace: boolean): Retrieval {
+  if (mode === 'docs') return 'docs';
+  return mode === 'auto' && hasSpace ? 'both' : 'web';
+}
+
+function toolbelt(retrieval: Retrieval): Anthropic.Tool[] {
+  return [
+    ...(retrieval === 'docs' ? [] : WEB_TOOLS),
+    ...(retrieval === 'web' ? [] : [SEARCH_DOCUMENTS_TOOL]),
+    ...MEMORY_TOOLS
+  ];
+}
 
 // With eager input streaming the API no longer validates tool inputs, so we do.
 const WebSearchInput = z.object({ query: z.string().trim().min(1).max(400), reason: z.string().optional() });
 const FetchPageInput = z.object({ url: z.string().url(), reason: z.string().optional() });
+const SearchDocumentsInput = z.object({ query: z.string().trim().min(1).max(400), reason: z.string().optional() });
 const SaveMemoryInput = z.object({ text: z.string().trim().min(1).max(MAX_MEMORY_CHARS), reason: z.string().optional() });
 
-function systemPrompt(): string {
-  const today = new Date().toISOString().slice(0, 10);
-  return `You are LUMINA, a search assistant that answers only from web pages it has actually read. Today is ${today}.
+/** The Space's documents listed in the prompt, at most. */
+const PROMPT_DOCUMENTS = 50;
 
+/** Where a chunk sits in its document, as the model and the trace read it. */
+export function where(l: Locator): string {
+  if (l.page !== undefined) return `p. ${l.page}`;
+  if (l.heading !== undefined) return `"${l.heading}"${l.line !== undefined ? `, line ${l.line}` : ''}`;
+  return `line ${l.line}`;
+}
+
+/**
+ * DESIGN.md: when a Space is selected, the prompt names its documents, so a question about
+ * what they cover goes to search_documents instead of the web.
+ */
+function spaceNote(space: SpaceContents): string {
+  const listed = space.indexed.slice(0, PROMPT_DOCUMENTS).map((d) => `- ${d.title}${d.pages ? ` (${d.pages} pages)` : ''}`);
+  const more = space.indexed.length - listed.length;
+  return [
+    `The user's selected Space is "${space.name}". Its searchable documents:`,
+    listed.length ? listed.join('\n') : '- (none indexed yet)',
+    more > 0 ? `- …and ${more} more` : '',
+    space.indexing.length ? `Still being indexed, not searchable yet: ${space.indexing.join(', ')}.` : '',
+    'A question about what these documents cover is answered from them, with search_documents.'
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function researchNote(retrieval: Retrieval): string {
+  if (retrieval === 'docs') {
+    return `- This search is over the user's documents only; there is no web search. Before your first turn the question has already been searched in them once, as asked, and the best-matching passages come with the question.
+- If those passages answer the question, answer straight away. If not, call search_documents again with different wording.`;
+  }
+  if (retrieval === 'both') {
+    return `- Before your first turn the question has already been searched once, as asked, both on the web (the top results read) and in the user's documents. Both sets of passages come with the question.
+- Decide what the question needs: the documents, the web, or both when it asks how the documents relate to what is on the web. Use only the passages that answer it.
+- If what you have answers the question, answer straight away. If not, use search_documents, web_search and fetch_page to look further. Make independent calls in parallel, in the same turn.`;
+  }
+  return `- Before your first turn the question has already been searched once, as asked, and the top results read. Their passages come with the question.
+- If those passages answer the question, answer straight away. If not, use web_search and fetch_page to look further. Make independent calls in parallel, in the same turn.`;
+}
+
+function systemPrompt(retrieval: Retrieval, space: SpaceContents | null): string {
+  const today = new Date().toISOString().slice(0, 10);
+  const from = retrieval === 'docs' ? "the user's documents" : retrieval === 'both' ? "web pages and the user's documents" : 'web pages';
+  return `You are LUMINA, a search assistant that answers only from ${from} it has actually read. Today is ${today}.
+${space && retrieval !== 'web' ? `\n${spaceNote(space)}\n` : ''}
 How to research:
-- Before your first turn the question has already been searched once, as asked, and the top results read. Their passages come with the question.
-- If those passages answer the question, answer straight away. If not, use web_search and fetch_page to look further. Make independent calls in parallel, in the same turn.
+${researchNote(retrieval)}
 - A run has at most ${env.maxToolCalls} tool calls, including the ones already made for you; the question says how many are left.
 - At most ${env.maxConsecutiveSameTool} calls in a row may use the same tool, counting the reads already made for you. A call past that is refused: answer from what you have, or use a different tool.
 - Write no text before or between tool calls. The only text you write is the final answer.
@@ -139,13 +238,13 @@ Memory:
 
 How to answer:
 - Put the direct answer in the first sentence, then only what the question needs. Keep it under about 150 words unless the question asks for depth; no headings for a short answer.
-- Each page you read has a source number. Cite a claim by putting that number in square brackets right after it, like this [2]. One number per bracket: [1][3], never [1, 3].
-- Cite only the source numbers given with the pages you read. Search results are not sources.
+- Each page and each document passage you read has a source number. Cite a claim by putting that number in square brackets right after it, like this [2]. One number per bracket: [1][3], never [1, 3].
+- Cite only the source numbers given with what you read. Web search results are not sources.
 - Make claims only from the passages you read. If they do not answer the question, say that plainly instead of guessing.
 
 Earlier turns:
 - If this is a follow-up, the conversation so far comes before the question. Use it to work out what the question refers to.
-- Earlier answers had their citation numbers removed, and the pages behind them cannot be cited now. Cite only pages read for this question.`;
+- Earlier answers had their citation numbers removed, and the sources behind them cannot be cited now. Cite only what was read for this question.`;
 }
 
 let anthropic: Anthropic | null = null;
@@ -158,6 +257,9 @@ export type QuickAsk = {
   userId: string;
   threadId: string;
   query: string;
+  mode: AskMode;
+  /** The selected Space and what is in it; null when none is selected or the mode is web. */
+  space: SpaceContents | null;
   /** Earlier turns of the thread, already trimmed, as alternating user/assistant messages. */
   history: Anthropic.MessageParam[];
   /** The thread's earlier questions, whole and oldest first, for a follow-up's first search. */
@@ -232,6 +334,11 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   const deadline = started + env.maxWallClockSec * 1000;
   const sse = new SseStream(res);
   const answerId = newId('ans');
+  const space = ask.space;
+  const retrieval = retrievalFor(ask.mode, Boolean(space));
+  const tools = toolbelt(retrieval);
+  const allowed = new Set(tools.map((t) => t.name));
+  const system = systemPrompt(retrieval, space);
 
   // One signal for everything this run starts: the LLM stream and every tool call.
   const abort = new AbortController();
@@ -244,8 +351,10 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   const messages: Anthropic.MessageParam[] = [...ask.history];
   const searchResults = new Map<string, SearchResult>(); // normalized url → first result that named it
   const searchQueries: string[] = [];
-  const pages: Page[] = [];
+  /** Everything citable, web pages and document chunks, numbered in the order it was read. */
+  const retrieved: Source[] = [];
   const pageByUrl = new Map<string, Page>();
+  const sourceByChunk = new Map<string, Source>();
   // Pushed as calls finish; the run log lists them by step, the order they were made.
   const calls: { step: number; call: RunLog['toolCalls'][number] }[] = [];
   /** Calls the thrash guard refused. Traced, but not in the run log, since they never ran. */
@@ -276,8 +385,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     sse.send('sources', list);
   };
 
-  const pageSources = (): Source[] =>
-    pages.map((p) => ({ n: p.n, kind: 'web', title: p.title, url: p.url, snippet: p.snippet }));
+  const retrievedSources = (): Source[] => [...retrieved];
 
   const emit = (text: string) => {
     if (!text) return;
@@ -417,7 +525,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     const parsed = FetchPageInput.safeParse(raw);
     const fail = (input: Record<string, unknown>, reason: string, error: string) => {
       // DESIGN: with nothing read yet, a failed read is a step toward the snippet fallback. Say so.
-      const note = pages.length ? '' : '; no page read yet, so the answer falls back to search snippets if none succeeds';
+      const note = retrieved.length ? '' : '; no page read yet, so the answer falls back to search snippets if none succeeds';
       trace(s, 'fetch_page', input, t0, { ok: false, reason: `${reason}${note}`, error });
       return { content: `Error: ${error}. This page cannot be cited.`, isError: true };
     };
@@ -454,8 +562,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     const sel = selectPassages(text, [ask.query, ...searchQueries].join(' '), PAGE_WORDS);
     if (!sel) return fail({ url }, reason, 'page had no readable passages');
 
-    const page: Page = { n: pages.length + 1, url: hit.url, title: hit.title || fetchedTitle || hostOf(hit.url), snippet: sel.snippet };
-    pages.push(page);
+    const page: Page = { n: retrieved.length + 1, url: hit.url, title: hit.title || fetchedTitle || hostOf(hit.url), snippet: sel.snippet };
+    retrieved.push({ n: page.n, kind: 'web', title: page.title, url: page.url, snippet: page.snippet });
     pageByUrl.set(normUrl(url), page);
     trace(s, 'fetch_page', { url }, t0, {
       ok: true,
@@ -465,6 +573,67 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       content: `Source [${page.n}]: ${page.title}\nURL: ${page.url}\n\n${sel.passages.join('\n\n')}`,
       isError: false
     };
+  }
+
+  /**
+   * Hybrid search over the selected Space. Each chunk becomes a source when it is first
+   * returned, its snippet cut from the chunk's own text exactly as a web page's is cut from
+   * the page; the model reads the whole chunk. A failure ends the run, like a dead search
+   * provider: the alternative is answering a document question without the documents.
+   */
+  async function runSearchDocuments(
+    s: number,
+    raw: unknown,
+    reasonDefault: string,
+    batch?: AbortSignal
+  ): Promise<{ content: string; isError: boolean; found: number }> {
+    const t0 = Date.now();
+    const parsed = SearchDocumentsInput.safeParse(raw);
+    if (!parsed.success || !space) {
+      const error = !space ? 'no Space is selected' : `invalid input: ${parsed.error!.issues[0]?.message ?? 'bad query'}`;
+      trace(s, 'search_documents', asInput(raw), t0, { ok: false, reason: 'rejected before searching', error });
+      return { content: `Error: ${error}`, isError: true, found: 0 };
+    }
+    const { query, reason = reasonDefault } = parsed.data;
+    const input = { query, spaceId: space.id };
+    let result: Awaited<ReturnType<typeof searchDocuments>>;
+    try {
+      result = await searchDocuments(ask.userId, space.id, query, toolSignal(batch));
+    } catch (err) {
+      const cancelled = cutShort(batch);
+      if (cancelled) {
+        trace(s, 'search_documents', input, t0, { ok: false, reason, error: cancelled });
+        throw err;
+      }
+      const e = err instanceof DocumentSearchError ? err : new DocumentSearchError(`document search: ${(err as Error).message}`);
+      log.error({ requestId: ask.requestId, err: e.cause ?? err }, 'search_documents failed');
+      trace(s, 'search_documents', input, t0, { ok: false, reason, error: e.message });
+      throw e;
+    }
+
+    const blocks = result.chunks.map((c) => {
+      let src = sourceByChunk.get(c.id);
+      if (!src) {
+        const snippet = selectPassages(unwrap(c.text), `${ask.query} ${query}`, PAGE_WORDS)?.snippet ?? c.text.replace(/\s+/g, ' ').trim();
+        src = { n: retrieved.length + 1, kind: 'doc', docId: c.docId, title: c.title, locator: c.locator, snippet };
+        retrieved.push(src);
+        sourceByChunk.set(c.id, src);
+      }
+      return { n: src.n, text: `Source [${src.n}]: ${c.title}, ${where(c.locator)}\n\n${c.text}` };
+    });
+    const fusedFrom = `RRF over ${result.vectorHits} vector + ${result.textHits} BM25 hits`;
+    const droppedNote = result.dropped ? `, ${result.dropped} from documents not yet indexed dropped` : '';
+    trace(s, 'search_documents', input, t0, {
+      ok: true,
+      reason: blocks.length
+        ? `${reason} → ${blocks.length} passages, sources ${blocks.map((b) => `[${b.n}]`).join('')} · ${fusedFrom}${droppedNote}`
+        : `${reason} → no matching passages · ${fusedFrom}${droppedNote}`
+    });
+    if (!blocks.length) {
+      const empty = space.indexed.length ? 'No passage in the Space\'s documents matched.' : 'The Space has no indexed documents yet.';
+      return { content: empty, isError: false, found: 0 };
+    }
+    return { content: blocks.map((b) => b.text).join('\n\n---\n\n'), isError: false, found: blocks.length };
   }
 
   /** Always the run's first step. A failure is a failed step, not a failed run: the answer goes on without memory, and says so in the trace. */
@@ -532,9 +701,9 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
           content,
           ...(isError ? { is_error: true } : {})
         });
-        if (!QUICK_TOOL_NAMES.has(tu.name)) {
-          log.warn({ requestId: ask.requestId, tool: tu.name }, 'quick run asked for a tool outside the quick toolbelt; refused');
-          return result(`Error: ${tu.name} is not available on a quick search.`, true);
+        if (!allowed.has(tu.name)) {
+          log.warn({ requestId: ask.requestId, tool: tu.name, retrieval }, 'quick run asked for a tool outside its toolbelt; refused');
+          return result(`Error: ${tu.name} is not available on this search.`, true);
         }
         if (step >= env.maxToolCalls) {
           capped = true;
@@ -560,7 +729,9 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         const r =
           tu.name === 'save_memory'
             ? await runSaveMemory(s, tu.input, batch)
-            : await runFetchPage(s, tu.input, env.fetchTimeoutMs, batch);
+            : tu.name === 'search_documents'
+              ? await runSearchDocuments(s, tu.input, 'search the documents', batch)
+              : await runFetchPage(s, tu.input, env.fetchTimeoutMs, batch);
         return result(r.content, r.isError);
       })
     );
@@ -580,8 +751,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       {
         model: env.llmModel,
         max_tokens: MAX_TOKENS_PER_TURN,
-        system: systemPrompt(),
-        tools: QUICK_TOOLS,
+        system,
+        tools,
         tool_choice: { type: mode === 'answer' ? 'none' : 'auto' },
         thinking: { type: 'adaptive' },
         output_config: { effort: 'low' },
@@ -592,8 +763,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     const forceAnswer = mode === 'answer';
 
     // Text is committed to the client only once it can only be the answer: when tools are
-    // off, or when there are pages to cite, no tool call has appeared in this turn, and the
-    // text already cites or is too long to be a preamble. Otherwise it is held, and
+    // off, or when there is something to cite, no tool call has appeared in this turn, and
+    // the text already cites or is too long to be a preamble. Otherwise it is held, and
     // discarded if the turn turns out to be a tool call.
     let held = '';
     let sawToolUse = false;
@@ -604,8 +775,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       else {
         held += ev.delta.text;
         const answering = forceAnswer || /\[\d/.test(held) || held.length >= COMMIT_AFTER_CHARS;
-        if (!sawToolUse && (forceAnswer || pages.length > 0) && answering) {
-          beginAnswer(pageSources());
+        if (!sawToolUse && (forceAnswer || retrieved.length > 0) && answering) {
+          beginAnswer(retrievedSources());
           write(held);
           held = '';
         }
@@ -613,8 +784,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     }
     const msg = await stream.finalMessage();
     // A short answer that never reached the threshold is still an answer if no tool followed.
-    if (!sources && held && pages.length > 0 && !msg.content.some((b) => b.type === 'tool_use')) {
-      beginAnswer(pageSources());
+    if (!sources && held && retrieved.length > 0 && !msg.content.some((b) => b.type === 'tool_use')) {
+      beginAnswer(retrievedSources());
       write(held);
       held = '';
     }
@@ -630,23 +801,29 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   try {
     // ---- step one, no model: search the question as asked, read the top results. A
     // follow-up that points back ("does it…") is searched with the question before it.
-    // Recall runs alongside it: neither needs the other, so it costs no time to first token.
+    // Docs mode searches the Space instead of the web; auto with a Space searches both, and
+    // the model decides what to use. Recall runs alongside: none of these needs another, so
+    // running them together costs no time to first token.
     const withContext = firstSearchQuery(ask);
+    const firstQuery = withContext ?? ask.query.slice(0, 400);
+    const asAsked = withContext ? 'the follow-up, with the earlier question it refers back to' : 'the question as asked';
     const recallStep = reserve('recall_memory');
-    const searchStep = reserve('web_search');
-    const [recalled, first] = (await settleBatch<unknown>([
+    const webStep = retrieval === 'docs' ? null : reserve('web_search');
+    const docsStep = retrieval === 'web' ? null : reserve('search_documents');
+    const docsReason =
+      retrieval === 'docs'
+        ? `docs mode: ${asAsked}, in the Space only`
+        : `auto mode with a Space selected: ${asAsked}, in the documents alongside the web`;
+    const [recalled, first, docs] = (await settleBatch<unknown>([
       (batch) => runRecall(recallStep, withContext ?? ask.query, batch),
-      (batch) =>
-        runWebSearch(
-          searchStep,
-          {
-            query: withContext ?? ask.query.slice(0, 400),
-            reason: withContext ? 'the follow-up, with the earlier question it refers back to' : 'the question as asked'
-          },
-          batch
-        )
-    ])) as [Awaited<ReturnType<typeof runRecall>>, Awaited<ReturnType<typeof runWebSearch>>];
-    const top = first.results.slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
+      async (batch) => (webStep === null ? null : runWebSearch(webStep, { query: firstQuery, reason: asAsked }, batch)),
+      async (batch) => (docsStep === null ? null : runSearchDocuments(docsStep, { query: firstQuery }, docsReason, batch))
+    ])) as [
+      Awaited<ReturnType<typeof runRecall>>,
+      Awaited<ReturnType<typeof runWebSearch>> | null,
+      Awaited<ReturnType<typeof runSearchDocuments>> | null
+    ];
+    const top = (first?.results ?? []).slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
     // Reserved synchronously per result, so steps are numbered in rank order. These count
     // toward the thrash guard's streak like any fetch_page the model makes.
     const reads = await settleBatch(
@@ -664,15 +841,24 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         ask.query,
         '---',
         memoryNote(recalled),
-        `The question was searched ${withContext ? 'together with the earlier question it refers back to' : 'as asked'} (${step} of ${env.maxToolCalls} tool calls used, ${Math.max(0, env.maxToolCalls - step)} left).`,
-        `Search results:\n${first.content}`,
-        read.length ? `Pages read, cite them by their source number:\n\n${read.join('\n\n---\n\n')}` : '',
+        `The question was searched ${retrieval === 'docs' ? "in the user's documents " : retrieval === 'both' ? "on the web and in the user's documents " : ''}${withContext ? 'together with the earlier question it refers back to' : 'as asked'} (${step} of ${env.maxToolCalls} tool calls used, ${Math.max(0, env.maxToolCalls - step)} left).`,
+        docs
+          ? docs.found
+            ? `Passages from the documents in "${space!.name}", cite them by their source number:\n\n${docs.content}`
+            : `Document search: ${docs.content}`
+          : '',
+        first ? `Web search results:\n${first.content}` : '',
+        read.length ? `Web pages read, cite them by their source number:\n\n${read.join('\n\n---\n\n')}` : '',
         unread.length ? `Not read in time (fetch_page can retry with a longer timeout):\n${unread.join('\n')}` : '',
         // Searched on its own words: right for a new topic, wrong for a follow-up the heuristic missed.
         ask.history.length && !withContext
           ? 'If this question continues the conversation and these results miss what it is about, search again with that spelled out.'
           : '',
-        'If the pages answer the question, answer now. If not, search again or read more results.'
+        retrieval === 'both'
+          ? 'Use the documents, the web, or both, whichever the question needs. If what you have answers it, answer now. If not, search again or read more.'
+          : retrieval === 'docs'
+            ? 'If the passages answer the question, answer now. If not, search the documents again with different wording.'
+            : 'If the pages answer the question, answer now. If not, search again or read more results.'
       ]
         .filter(Boolean)
         .join('\n\n')
@@ -742,13 +928,17 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       // Out of time mid-turn. Keep whatever answer exists, and say plainly that it stopped.
       terminated = 'cap';
       capped = true;
-      beginAnswer(sources ?? pageSources());
+      beginAnswer(sources ?? retrievedSources());
       emit(filter?.flush() ?? '');
       emit(`${answerText ? '\n\n' : ''}The search stopped at its ${env.maxWallClockSec} s limit before the answer was finished.`);
     } else {
       terminated = 'error';
       const gone = reason instanceof ClientGone;
-      const upstream = err instanceof Anthropic.APIError || err instanceof SearchProviderError || err instanceof ModelRefusal;
+      const upstream =
+        err instanceof Anthropic.APIError ||
+        err instanceof SearchProviderError ||
+        err instanceof DocumentSearchError ||
+        err instanceof ModelRefusal;
       const status = upstream || gone ? 502 : 500;
       const message = gone
         ? 'client disconnected'
@@ -837,6 +1027,9 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         userId: ask.userId,
         threadId: ask.threadId,
         answerId,
+        mode: ask.mode,
+        retrieval,
+        ...(space ? { spaceId: space.id } : {}),
         toolCalls: runLog.toolCalls.length,
         refused,
         terminated,
