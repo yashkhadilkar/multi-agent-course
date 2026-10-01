@@ -10,6 +10,7 @@
     "worker": "tsx watch src/worker.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "start:worker": "node dist/worker.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "runs:split": "node scripts/split-runs.mjs"
   },

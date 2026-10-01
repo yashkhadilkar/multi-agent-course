@@ -38,12 +38,14 @@
  */
 import express from 'express';
 import pino from 'pino';
-import { AskBody, CreateThreadBody, HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER, newId } from '@lumina/contract';
+import { AskBody, CreateSpaceBody, CreateThreadBody, HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER, newId } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
+import { workerHealth, type WorkerHealth } from './jobs.js';
 import { deleteMemory, listMemories } from './memory.js';
 import { runQuick } from './quick.js';
 import { computeStats } from './runlog.js';
+import { addDocument, createSpace, findSpace, listDocuments, listSpaces, receiveUpload } from './spaces.js';
 import { beginTurn, createThread, findThread, getThread, listThreads, saveAnswer } from './threads.js';
 
 const log = pino({ level: env.logLevel });
@@ -97,20 +99,31 @@ const handle =
 
 // No X-User-Id here: the grader and Fly's health check call it bare. `ai` is left off on
 // purpose, because the gateway nests this whole body there; the agent does not grade itself.
+// `worker` is the jobs worker's last heartbeat: a dead worker makes this degraded, instead of
+// uploads sitting at `pending` with nothing saying why.
 app.get('/health', async (_req, res) => {
   const ping = await pingDb();
   // Log the reason but keep it out of the body: a driver error can name the cluster host.
   if (ping.status === 'down') log.error({ err: ping.error }, 'health: mongo ping failed');
 
+  let worker: WorkerHealth | { status: 'unknown'; lastHeartbeat: null } = { status: 'unknown', lastHeartbeat: null };
+  if (ping.status === 'ok') {
+    worker = await workerHealth().catch((err: unknown) => {
+      log.error({ err }, 'health: reading the worker heartbeat failed');
+      return { status: 'unknown' as const, lastHeartbeat: null };
+    });
+  }
+  const healthy = ping.status === 'ok' && worker.status === 'ok';
+
   const body = HealthResponse.parse({
-    status: ping.status === 'ok' ? 'ok' : 'degraded',
+    status: healthy ? 'ok' : 'degraded',
     model: env.llmModel,
     searchProvider: env.searchProvider,
     vectorStore: env.vectorBackend,
     db: ping.status
   });
   // 503 when degraded, the same convention the gateway uses; bench reads the body either way.
-  res.status(ping.status === 'ok' ? 200 : 503).json(body);
+  res.status(healthy ? 200 : 503).json({ ...body, worker });
 });
 
 // ---------------------------------------------------------------- /stats
@@ -209,6 +222,47 @@ app.delete(
   })
 );
 
+// ---------------------------------------------------------------- spaces & documents
+
+app.post(
+  '/spaces',
+  handle('creating the space', async (req, res, { userId }) => {
+    const parsed = CreateSpaceBody.safeParse(req.body ?? {});
+    if (!parsed.success) return reject(res, 400, badBody(parsed.error));
+    res.status(201).json(await createSpace(userId, parsed.data.name));
+  })
+);
+
+app.get(
+  '/spaces',
+  handle('listing spaces', async (_req, res, { userId }) => {
+    res.json(await listSpaces(userId));
+  })
+);
+
+// Another user's Space is a 404, checked before the body is read: they learn nothing, and
+// nobody's 25 MB gets buffered for a Space they cannot write to.
+app.post(
+  '/spaces/:spaceId/documents',
+  handle('accepting the upload', async (req, res, { userId }) => {
+    const { spaceId } = req.params as { spaceId: string };
+    if (!(await findSpace(userId, spaceId))) return reject(res, 404, `unknown space ${spaceId}`);
+    const upload = await receiveUpload(req, res);
+    if ('error' in upload) return reject(res, upload.status, upload.error);
+    // Stored and queued, nothing more: parsing, embedding and the probe are the worker's.
+    res.status(202).json(await addDocument(userId, spaceId, upload));
+  })
+);
+
+app.get(
+  '/spaces/:spaceId/documents',
+  handle('listing documents', async (req, res, { userId }) => {
+    const { spaceId } = req.params as { spaceId: string };
+    if (!(await findSpace(userId, spaceId))) return reject(res, 404, `unknown space ${spaceId}`);
+    res.json(await listDocuments(userId, spaceId));
+  })
+);
+
 // ---------------------------------------------------------------- everything else: 501
 
 const notImplemented = (route: string) => (_req: express.Request, res: express.Response) => {
@@ -224,7 +278,11 @@ const IMPLEMENTED = new Set([
   'GET /threads/:threadId',
   'POST /threads/:threadId/ask',
   'GET /memory',
-  'DELETE /memory/:memoryId'
+  'DELETE /memory/:memoryId',
+  'POST /spaces',
+  'GET /spaces',
+  'POST /spaces/:spaceId/documents',
+  'GET /spaces/:spaceId/documents'
 ]);
 
 for (const route of ROUTES) {
@@ -246,6 +304,8 @@ app.use((err: Error & { type?: string }, _req: express.Request, res: express.Res
 });
 
 app.listen(env.port, () => {
+  // Connect now rather than inside the first request, which would pay for the handshake.
+  void pingDb().then((p) => p.status === 'down' && log.error({ err: p.error }, 'mongo not reachable at boot'));
   log.info(
     {
       port: env.port,

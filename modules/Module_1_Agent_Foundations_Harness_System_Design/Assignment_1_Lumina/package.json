@@ -14,8 +14,9 @@
     "web"
   ],
   "scripts": {
-    "dev": "npm run build -w @lumina/contract && concurrently -k -n agent,gateway,web -c magenta,cyan,green \"npm:dev:agent\" \"npm:dev:gateway\" \"npm:dev:web\"",
+    "dev": "npm run build -w @lumina/contract && concurrently -k -n agent,worker,gateway,web -c magenta,yellow,cyan,green \"npm:dev:agent\" \"npm:dev:worker\" \"npm:dev:gateway\" \"npm:dev:web\"",
     "dev:agent": "npm run dev -w @lumina/agent",
+    "dev:worker": "npm run worker -w @lumina/agent",
     "dev:gateway": "npm run dev -w @lumina/gateway",
     "dev:web": "npm run dev -w @lumina/web",
     "worker": "npm run worker -w @lumina/agent",

@@ -11,7 +11,9 @@ let connecting: Promise<MongoClient> | null = null;
 export async function db(): Promise<Db> {
   if (!env.mongoUri) throw new Error('MONGODB_URI is not set — copy .env.example to .env');
   if (!connecting) {
-    const client = new MongoClient(env.mongoUri, { serverSelectionTimeoutMS: 5000 });
+    // A few connections kept open: a TLS handshake to Atlas costs more than the whole 300 ms
+    // an upload has for its 202, and the upload's last writes run in parallel.
+    const client = new MongoClient(env.mongoUri, { serverSelectionTimeoutMS: 5000, minPoolSize: 4 });
     connecting = client.connect().catch((err: unknown) => {
       connecting = null;
       void client.close().catch(() => {});

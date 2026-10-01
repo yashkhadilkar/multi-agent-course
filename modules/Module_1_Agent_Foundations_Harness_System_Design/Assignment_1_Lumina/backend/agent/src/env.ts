@@ -51,6 +51,19 @@ export const env = {
 
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
 
+  // Ingestion, on the jobs worker. Chunk sizes are characters (English runs about four to a token).
+  chunkSizeChars: num(process.env.CHUNK_SIZE_CHARS, 1000),
+  chunkOverlapChars: num(process.env.CHUNK_OVERLAP_CHARS, 200),
+  /** Chunks per embeddings request. A resumed job restarts after the last batch it finished. */
+  embedBatchSize: num(process.env.EMBED_BATCH_SIZE, 64),
+  /** DESIGN.md: a running job with no heartbeat for this long is stale; /health uses the same window for the worker. */
+  jobStaleMs: num(process.env.JOB_STALE_MS, 120_000),
+  jobMaxAttempts: num(process.env.JOB_MAX_ATTEMPTS, 3),
+  workerHeartbeatMs: num(process.env.WORKER_HEARTBEAT_MS, 10_000),
+  workerPollMs: num(process.env.WORKER_POLL_MS, 1000),
+  /** How long the read-your-write probe waits for Atlas to make a fresh chunk searchable. */
+  probeTimeoutMs: num(process.env.PROBE_TIMEOUT_MS, 90_000),
+
   // Deep search is the expensive gear, so its limits are configuration, not code.
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
   deepSubQuestionsMax: num(process.env.DEEP_SUB_QUESTIONS_MAX, 6),
@@ -67,6 +80,11 @@ export const env = {
 
   logLevel: process.env.LOG_LEVEL ?? 'info'
 } as const;
+
+// An overlap as long as the chunk never advances; refuse it at boot rather than spin.
+if (env.chunkOverlapChars < 0 || env.chunkOverlapChars >= env.chunkSizeChars) {
+  throw new Error(`CHUNK_OVERLAP_CHARS (${env.chunkOverlapChars}) must be at least 0 and below CHUNK_SIZE_CHARS (${env.chunkSizeChars})`);
+}
 
 /** Never log or return these. /health names the model; it never echoes a key. */
 export const secrets = {
