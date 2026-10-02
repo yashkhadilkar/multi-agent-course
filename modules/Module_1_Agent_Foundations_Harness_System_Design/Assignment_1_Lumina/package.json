@@ -18,7 +18,7 @@
     "dev:agent": "npm run dev -w @lumina/agent",
     "dev:worker": "npm run worker -w @lumina/agent",
     "dev:gateway": "npm run dev -w @lumina/gateway",
-    "dev:web": "npm run dev -w @lumina/web",
+    "dev:web": "cd web && node --env-file=../.env ../node_modules/vite/bin/vite.js",
     "worker": "npm run worker -w @lumina/agent",
     "build": "npm run build -w @lumina/contract && npm run build -w @lumina/agent && npm run build -w @lumina/gateway && npm run build -w @lumina/web",
     "typecheck": "npm run typecheck --workspaces --if-present",

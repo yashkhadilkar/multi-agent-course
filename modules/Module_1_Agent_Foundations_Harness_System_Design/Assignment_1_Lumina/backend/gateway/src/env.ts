@@ -20,5 +20,7 @@ export const env = {
   rateLimitPerMinute: num(process.env.RATE_LIMIT_PER_MINUTE, 30),
   logLevel: process.env.LOG_LEVEL ?? 'info',
   /** Serve the built UI from the gateway in production so one host serves / and /evals. */
-  webDist: resolve(process.cwd(), '../../web/dist')
+  webDist: resolve(process.cwd(), '../../web/dist'),
+  /** Where eval/build-report.mjs writes by default; served as GET /evals/report.json. */
+  evalsReport: resolve(process.cwd(), '../../reports/report.json')
 } as const;
