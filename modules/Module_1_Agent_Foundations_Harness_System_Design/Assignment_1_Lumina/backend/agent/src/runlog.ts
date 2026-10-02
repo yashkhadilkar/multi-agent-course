@@ -12,6 +12,7 @@
  */
 import { COLLECTIONS, RequestDoc, RunDoc, StatsResponse, type Depth, type RunLog } from '@lumina/contract';
 import { db } from './db.js';
+import { deepToday } from './deepcap.js';
 import { env } from './env.js';
 
 export type AnswerRecord = {
@@ -82,7 +83,7 @@ function p95(values: number[]): number {
 
 const utcMidnight = (now = new Date()) => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 
-type Row = { terminated?: string; costUsd?: number; ttftMs?: number; searchCached?: boolean; depth?: Depth; userId: string; createdAt: Date };
+type Row = { terminated?: string; costUsd?: number; ttftMs?: number; searchCached?: boolean; depth?: Depth; createdAt: Date };
 
 /**
  * Counts cover every stored record; cost and deep searches cover the current UTC day.
@@ -93,7 +94,7 @@ export async function computeStats(userId: string): Promise<StatsResponse> {
   const since = utcMidnight();
   const rows = await (await db())
     .collection<Row>(COLLECTIONS.requests)
-    .find({}, { projection: { _id: 0, terminated: 1, costUsd: 1, ttftMs: 1, searchCached: 1, depth: 1, userId: 1, createdAt: 1 } })
+    .find({}, { projection: { _id: 0, terminated: 1, costUsd: 1, ttftMs: 1, searchCached: 1, depth: 1, createdAt: 1 } })
     .toArray();
 
   const answers = rows.filter((r) => r.terminated === 'done' || r.terminated === 'cap');
@@ -108,8 +109,9 @@ export async function computeStats(userId: string): Promise<StatsResponse> {
       : 0,
     ttftP95Ms: p95(answers.map((r) => r.ttftMs ?? NaN)),
     costUsdToday: Math.round(costUsdToday * 1e6) / 1e6,
-    // Counted from the records until deep search exists; its atomic counter replaces this.
-    deepToday: today.filter((r) => r.depth === 'deep' && r.userId === userId).length,
+    // The gate's own counter, not the records: a slot is spent when a run starts, and a run
+    // that errored before its record was written still spent one.
+    deepToday: await deepToday(userId),
     deepDailyCap: env.deepDailyCap
   });
 }

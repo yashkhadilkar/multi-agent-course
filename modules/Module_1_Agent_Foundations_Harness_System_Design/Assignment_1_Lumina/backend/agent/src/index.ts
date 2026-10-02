@@ -41,6 +41,8 @@ import pino from 'pino';
 import { AskBody, CreateSpaceBody, CreateThreadBody, HealthResponse, REQUEST_HEADER, ROUTES, USER_HEADER, newId } from '@lumina/contract';
 import { env } from './env.js';
 import { pingDb } from './db.js';
+import { runDeep } from './deep.js';
+import { takeDeepSlot } from './deepcap.js';
 import { workerHealth, type WorkerHealth } from './jobs.js';
 import { deleteMemory, listMemories } from './memory.js';
 import { runQuick } from './quick.js';
@@ -183,9 +185,6 @@ app.post(
 
     // Everything that can be known up front is a real status, before the first byte of the stream.
     if (!(await findThread(userId, threadId))) return reject(res, 404, `unknown thread ${threadId}`);
-    // Deep is refused rather than quietly run as quick: the server reports the gear it ran,
-    // and it never changes the one the client asked for.
-    if (ask.depth === 'deep') return reject(res, 501, 'not implemented yet: depth "deep"');
     // Another user's Space is a 404 here too. Web mode never searches it, so it skips the listing.
     let space: SpaceContents | null = null;
     if (ask.spaceId) {
@@ -193,10 +192,25 @@ app.post(
       if (!found) return reject(res, 404, `unknown space ${ask.spaceId}`);
       if (ask.mode !== 'web') space = await spaceContents(userId, found._id, found.name);
     }
+    // The spend gate, last of the up-front checks so a 404 never costs a slot. Checked and
+    // taken in one atomic step; the slot is spent from here on, whatever the run ends as.
+    if (ask.depth === 'deep') {
+      const slot = await takeDeepSlot(userId);
+      if (!slot.ok) {
+        log.info({ requestId, userId, deepToday: slot.used, deepDailyCap: env.deepDailyCap }, 'deep search refused: daily cap');
+        return res.status(429).json({
+          error: `deep search daily cap reached: ${env.deepDailyCap} per day`,
+          status: 429,
+          resetsAt: slot.resetsAt.toISOString(),
+          requestId
+        });
+      }
+    }
 
     // The question is saved whatever the run's outcome; the answer only if it ends done or cap.
     const { questionId, history, earlierQuestions } = await beginTurn(userId, threadId, ask.query);
-    await runQuick(
+    // The gear the client asked for, never another: quick has no path to plan_research.
+    await (ask.depth === 'deep' ? runDeep : runQuick)(
       {
         requestId,
         userId,

@@ -79,6 +79,10 @@ export const env = {
   deepSubQuestionsMin: num(process.env.DEEP_SUB_QUESTIONS_MIN, 3),
   deepSubQuestionsMax: num(process.env.DEEP_SUB_QUESTIONS_MAX, 6),
   deepDailyCap: num(process.env.DEEP_DAILY_CAP, 5),
+  /** Sub-questions researched at once (DESIGN.md: "a few at a time"). */
+  deepConcurrency: num(process.env.DEEP_CONCURRENCY, 3),
+  /** One page read on a deep run gives up after this; a slow publisher must not hold up its wave. */
+  deepFetchTimeoutMs: num(process.env.DEEP_FETCH_TIMEOUT_MS, 6000),
 
   // The hard caps from AGENTS.md. Raising these to make a gate pass is the failure mode
   // the caps exist to catch. Two gears, two envelopes.

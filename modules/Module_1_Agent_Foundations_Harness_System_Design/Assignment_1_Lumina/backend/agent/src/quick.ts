@@ -248,7 +248,7 @@ Earlier turns:
 }
 
 let anthropic: Anthropic | null = null;
-const llm = () => (anthropic ??= new Anthropic({ apiKey: secrets.anthropic, maxRetries: 1 }));
+export const llm = () => (anthropic ??= new Anthropic({ apiKey: secrets.anthropic, maxRetries: 1 }));
 
 // ---------------------------------------------------------------- the run
 
@@ -279,10 +279,10 @@ class ModelRefusal extends Error {}
 const asInput = (raw: unknown): Record<string, unknown> =>
   raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
 
-const normUrl = (u: string) => u.replace(/#.*$/, '').replace(/\/+$/, '');
+export const normUrl = (u: string) => u.replace(/#.*$/, '').replace(/\/+$/, '');
 
 /** The recalled memories as the model sees them, most relevant first. Empty when there are none. */
-function memoryNote({ memories, error }: { memories: RecalledMemory[]; error?: string }): string {
+export function memoryNote({ memories, error }: { memories: RecalledMemory[]; error?: string }): string {
   if (error) return 'About this user: saved memories could not be loaded for this question.';
   if (!memories.length) return '';
   const lines = memories.map((m) => `- ${m.text} (saved ${m.createdAt.toISOString().slice(0, 10)})`);

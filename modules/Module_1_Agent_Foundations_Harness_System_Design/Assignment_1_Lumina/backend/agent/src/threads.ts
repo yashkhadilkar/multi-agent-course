@@ -29,6 +29,7 @@ import {
   newId,
   type DoneEvent,
   type Source,
+  type SubQuestion,
   type ThreadDoc
 } from '@lumina/contract';
 import { db } from './db.js';
@@ -51,7 +52,8 @@ const HISTORY_SOURCE_TITLES = 6;
 type StoredThread = ThreadDoc & { untitled?: boolean };
 type StoredMessage = MessageDoc & { replyTo?: string };
 
-export type SavedAnswer = { answerId: string; content: string; sources: Source[]; done: DoneEvent };
+/** `subQuestions` is the plan a deep search ran, kept so the answer stays explainable after the stream. */
+export type SavedAnswer = { answerId: string; content: string; sources: Source[]; done: DoneEvent; subQuestions?: SubQuestion[] };
 
 const threads = async () => (await db()).collection<StoredThread>(COLLECTIONS.threads);
 const messages = async () => (await db()).collection<StoredMessage>(COLLECTIONS.messages);
@@ -158,6 +160,7 @@ export async function saveAnswer(userId: string, threadId: string, replyTo: stri
     answerId: a.answerId,
     sources: a.sources,
     done: a.done,
+    ...(a.subQuestions ? { subQuestions: a.subQuestions } : {}),
     createdAt: new Date()
   });
   await (await messages()).insertOne({ ...doc, replyTo });
