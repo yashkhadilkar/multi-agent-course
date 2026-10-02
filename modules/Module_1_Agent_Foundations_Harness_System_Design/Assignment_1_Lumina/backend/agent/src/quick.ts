@@ -6,7 +6,8 @@
  *   1. Only a page fetch_page actually read becomes a source. It is numbered at the moment
  *      it is read, and the model sees that number next to the passages it may cite.
  *   2. The source's snippet is cut from the fetched text (passages.ts). The model never
- *      writes it.
+ *      writes it. It must also appear in the page's plain HTML, fetched alongside the read
+ *      (verify.ts); a page whose text is not there is dropped, not cited.
  *   3. The source list is final before the first token: once the answer starts, no more
  *      tools run, so the numbers the model was shown are the only ones that exist.
  *   4. Any [n] in the streamed text that is not in that list is dropped before it reaches
@@ -53,9 +54,10 @@ import { MAX_MEMORY_CHARS, recallMemories, saveMemory, type RecalledMemory } fro
 import { selectPassages, unwrap } from './passages.js';
 import { DocumentSearchError, searchDocuments, type SpaceContents } from './retrieval.js';
 import { recordAnswer } from './runlog.js';
-import { FetchError, SearchProviderError, fetchPage, hostOf, type SearchResult } from './search.js';
+import { FetchError, SearchProviderError, hostOf, type SearchResult } from './search.js';
 import { CitationFilter, SseStream } from './sse.js';
 import type { SavedAnswer } from './threads.js';
+import { chooseSnippet, choiceNote, readWithPlain, type PlainPage } from './verify.js';
 
 /** Words of each fetched page the model reads. Four pages of this stay well inside quick's cost budget. */
 const PAGE_WORDS = 700;
@@ -354,6 +356,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   /** Everything citable, web pages and document chunks, numbered in the order it was read. */
   const retrieved: Source[] = [];
   const pageByUrl = new Map<string, Page>();
+  /** Pages read whose text is not in their plain HTML, by normalized url, with why. Never sources. */
+  const notCitable = new Map<string, string>();
   const sourceByChunk = new Map<string, Source>();
   // Pushed as calls finish; the run log lists them by step, the order they were made.
   const calls: { step: number; call: RunLog['toolCalls'][number] }[] = [];
@@ -542,12 +546,18 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     // invented page gets into an answer.
     if (!hit) return fail({ url }, reason, 'url was not returned by web_search in this request');
 
+    // Read before and found not to be on the page as served: reading it again changes nothing.
+    const dropped = notCitable.get(normUrl(url));
+    if (dropped) return fail({ url }, reason, dropped);
+
     let text: string;
     let fetchedTitle: string | undefined;
+    let plain: PlainPage;
     fetchAttempts++;
     try {
       if (env.searchProvider === 'tavily') usage.extracts++;
-      ({ text, title: fetchedTitle } = await fetchPage(hit.url, toolSignal(batch, timeoutMs)));
+      // The plain HTML comes back alongside the read, under the same timeout (verify.ts).
+      ({ text, title: fetchedTitle, plain } = await readWithPlain(hit.url, toolSignal(batch, timeoutMs)));
     } catch (err) {
       const cancelled = cutShort(batch);
       if (cancelled) {
@@ -561,13 +571,18 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
 
     const sel = selectPassages(text, [ask.query, ...searchQueries].join(' '), PAGE_WORDS);
     if (!sel) return fail({ url }, reason, 'page had no readable passages');
+    const choice = chooseSnippet(sel.candidates, plain);
+    if (!choice.keep) {
+      notCitable.set(normUrl(url), choice.reason);
+      return fail({ url }, reason, choice.reason);
+    }
 
-    const page: Page = { n: retrieved.length + 1, url: hit.url, title: hit.title || fetchedTitle || hostOf(hit.url), snippet: sel.snippet };
+    const page: Page = { n: retrieved.length + 1, url: hit.url, title: hit.title || fetchedTitle || hostOf(hit.url), snippet: choice.snippet };
     retrieved.push({ n: page.n, kind: 'web', title: page.title, url: page.url, snippet: page.snippet });
     pageByUrl.set(normUrl(url), page);
     trace(s, 'fetch_page', { url }, t0, {
       ok: true,
-      reason: `${reason} → source [${page.n}], ${sel.passages.length} of ${sel.totalPassages} passages kept`
+      reason: `${reason} → source [${page.n}], ${sel.passages.length} of ${sel.totalPassages} passages kept · ${choiceNote(choice)}`
     });
     return {
       content: `Source [${page.n}]: ${page.title}\nURL: ${page.url}\n\n${sel.passages.join('\n\n')}`,

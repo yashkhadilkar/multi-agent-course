@@ -17,7 +17,8 @@
  *      fan-out trace step carries the sub-question it served.
  *   5. One synthesis call writes a direct answer, a section per sub-question, then what is
  *      still unknown, under the same grounding rules as quick: snippets cut from the read
- *      text, the source list final before the first token, unknown [n] dropped as it streams.
+ *      text and found in the page's plain HTML (verify.ts), the source list final before the
+ *      first token, unknown [n] dropped as it streams.
  *
  * Budget: MAX_TOOL_CALLS_DEEP calls on one shared counter. Planning and recall take two;
  * the rest are split evenly across the sub-questions. When the counter (or the research
@@ -45,8 +46,9 @@ import { selectPassages, unwrap } from './passages.js';
 import { llm, memoryNote, normUrl, retrievalFor, where, type QuickAsk, type Retrieval } from './quick.js';
 import { DocumentSearchError, searchDocuments } from './retrieval.js';
 import { recordAnswer } from './runlog.js';
-import { FetchError, SearchProviderError, fetchPage, hostOf, type SearchResult } from './search.js';
+import { FetchError, SearchProviderError, hostOf, type SearchResult } from './search.js';
 import { CitationFilter, SseStream } from './sse.js';
+import { chooseSnippet, choiceNote, readWithPlain, type PlainPage } from './verify.js';
 
 /** Words of each page the synthesis reads. Smaller than quick's: a deep answer reads three or four times the pages. */
 const PAGE_WORDS = 450;
@@ -411,9 +413,11 @@ export async function runDeep(ask: DeepAsk, res: Response, log: Logger): Promise
     };
     let text: string;
     let fetchedTitle: string | undefined;
+    let plain: PlainPage;
     try {
       if (env.searchProvider === 'tavily') usage.extracts++;
-      ({ text, title: fetchedTitle } = await fetchPage(hit.url, toolSignal(batch, env.deepFetchTimeoutMs)));
+      // The plain HTML comes back alongside the read, under the same timeout (verify.ts).
+      ({ text, title: fetchedTitle, plain } = await readWithPlain(hit.url, toolSignal(batch, env.deepFetchTimeoutMs)));
     } catch (err) {
       const cancelled = cutShort(batch);
       if (cancelled) {
@@ -425,9 +429,14 @@ export async function runDeep(ask: DeepAsk, res: Response, log: Logger): Promise
     }
     const sel = selectPassages(text, `${sub.question} ${ask.query}`, PAGE_WORDS);
     if (!sel) return fail('page had no readable passages');
+    const choice = chooseSnippet(sel.candidates, plain);
+    if (!choice.keep) return fail(choice.reason);
     pagesRead++;
-    trace(s, sub.i, 'fetch_page', input, t0, { ok: true, reason: `${reason} → ${sel.passages.length} of ${sel.totalPassages} passages kept` });
-    return { kind: 'web', url: hit.url, title: hit.title || fetchedTitle || hostOf(hit.url), snippet: sel.snippet, passages: sel.passages };
+    trace(s, sub.i, 'fetch_page', input, t0, {
+      ok: true,
+      reason: `${reason} → ${sel.passages.length} of ${sel.totalPassages} passages kept · ${choiceNote(choice)}`
+    });
+    return { kind: 'web', url: hit.url, title: hit.title || fetchedTitle || hostOf(hit.url), snippet: choice.snippet, passages: sel.passages };
   }
 
   /** Hybrid search over the Space. A failure ends the run, as in quick. */

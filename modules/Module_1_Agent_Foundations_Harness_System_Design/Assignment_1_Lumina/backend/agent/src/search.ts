@@ -13,7 +13,12 @@ import { Readability } from '@mozilla/readability';
 import { env, secrets } from './env.js';
 
 export type SearchResult = { title: string; url: string; snippet: string };
-export type FetchedPage = { text: string; title?: string };
+/**
+ * `html` is the page exactly as a plain GET served it, when the reader made one (SerpApi
+ * mode). verify.ts checks snippets against it; Tavily's extract has none, so there the plain
+ * fetch runs alongside it.
+ */
+export type FetchedPage = { text: string; title?: string; html?: string };
 
 /** The search provider itself failed. Ends the run: the answer would have nothing under it. */
 export class SearchProviderError extends Error {
@@ -139,7 +144,10 @@ async function readPage(url: string, signal: AbortSignal): Promise<FetchedPage> 
   }
   if (!res.ok) throw new FetchError(`${res.status} from publisher`);
   const type = res.headers.get('content-type') ?? '';
-  if (type.startsWith('text/plain')) return { text: (await res.text()).slice(0, MAX_HTML_BYTES) };
+  if (type.startsWith('text/plain')) {
+    const plain = (await res.text()).slice(0, MAX_HTML_BYTES);
+    return { text: plain, html: plain };
+  }
   if (!type.includes('html')) throw new FetchError(`unsupported content-type ${type || 'unknown'}`);
 
   const html = (await res.text()).slice(0, MAX_HTML_BYTES);
@@ -150,7 +158,7 @@ async function readPage(url: string, signal: AbortSignal): Promise<FetchedPage> 
   const blocks = article.content.replace(/<\/(p|div|li|h[1-6]|pre|blockquote|tr|section|article)>/gi, '\n$&');
   const text = new JSDOM(blocks).window.document.body.textContent?.trim() ?? '';
   if (!text) throw new FetchError('no readable article text');
-  return { text, title: article.title?.trim() || undefined };
+  return { text, title: article.title?.trim() || undefined, html };
 }
 
 export function hostOf(url: string): string {

@@ -92,8 +92,14 @@ export type Selection = {
   /** What the model reads: the best passages, in page order, within the word budget. */
   passages: string[];
   totalPassages: number;
-  /** The one passage a citation of this page points at. */
+  /** The one passage a citation of this page points at: candidates[0]. */
   snippet: string;
+  /**
+   * Every snippet a citation of this page could rest on, best first: windows of the passages
+   * the model reads, so whichever is chosen is text the model actually saw. verify.ts takes
+   * the first that also appears in the page's plain HTML.
+   */
+  candidates: string[];
 };
 
 export function selectPassages(text: string, query: string, maxWords: number): Selection | null {
@@ -112,10 +118,32 @@ export function selectPassages(text: string, query: string, maxWords: number): S
     if (budget < MIN_PASSAGE_WORDS) break;
   }
   if (!kept.length && ranked[0]) kept.push({ ...ranked[0], text: ranked[0].text.split(' ').slice(0, maxWords).join(' ') });
-  kept.sort((a, b) => a.ord - b.ord);
 
-  const best = ranked.find((p) => wordCount(p.text) >= SNIPPET_MIN_WORDS) ?? ranked[0]!;
-  return { passages: kept.map((p) => p.text), totalPassages: all.length, snippet: snippetOf(best.text, query) };
+  // Candidates come from the kept passages, best-scoring first, and long enough ones first,
+  // so the snippet is never shorter than the grounding check's window when it can be helped.
+  const byScore = [...kept].sort((a, b) => b.score - a.score || a.ord - b.ord);
+  const long = byScore.filter((p) => wordCount(p.text) >= SNIPPET_MIN_WORDS);
+  const candidates = [...new Set([...long, ...byScore.filter((p) => !long.includes(p))].flatMap((p) => windowsOf(p.text, query)))];
+  kept.sort((a, b) => a.ord - b.ord);
+  return { passages: kept.map((p) => p.text), totalPassages: all.length, snippet: candidates[0]!, candidates };
+}
+
+/** The passage's best snippet, then a window starting at each of its other sentences. */
+function windowsOf(passage: string, query: string): string[] {
+  const best = snippetOf(passage, query);
+  if (wordCount(passage) <= SNIPPET_MAX_WORDS) return [best];
+  const ss = sentences(passage);
+  const out = [best];
+  for (let start = 0; start < ss.length; start++) {
+    const words: string[] = [];
+    for (const s of ss.slice(start)) {
+      words.push(...s.split(' ').filter(Boolean));
+      if (words.length >= SNIPPET_MIN_WORDS) break;
+    }
+    if (words.length < SNIPPET_MIN_WORDS) break;
+    out.push(words.slice(0, SNIPPET_MAX_WORDS).join(' '));
+  }
+  return out;
 }
 
 /**
