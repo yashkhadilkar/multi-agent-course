@@ -33,6 +33,7 @@ import {
   type ThreadDoc
 } from '@lumina/contract';
 import { db } from './db.js';
+import { env } from './env.js';
 
 const DEFAULT_TITLE = 'New thread';
 /** A thread created without a title takes the first question's opening as one. */
@@ -48,6 +49,8 @@ const OLDER_ANSWER_CHARS = 200;
 const QUESTION_CHARS = 500;
 /** Source titles shown with a recent answer, so "the second one" still means something. */
 const HISTORY_SOURCE_TITLES = 6;
+/** A question with no answer this long after it was asked never gets one: past the longest run's cap, with margin. */
+const UNANSWERED_FINAL_MS = (env.maxWallClockSecDeep + 60) * 1000;
 
 type StoredThread = ThreadDoc & { untitled?: boolean };
 type StoredMessage = MessageDoc & { replyTo?: string };
@@ -120,7 +123,7 @@ export async function beginTurn(
   userId: string,
   threadId: string,
   query: string
-): Promise<{ questionId: string; history: Anthropic.MessageParam[]; earlierQuestions: string[] }> {
+): Promise<{ questionId: string; history: Anthropic.MessageParam[]; stableHistory: number; earlierQuestions: string[] }> {
   const questionId = messageId();
   const col = await messages();
   const question = MessageDoc.parse({
@@ -142,9 +145,11 @@ export async function beginTurn(
       )
     )
   ]);
+  const { messages: history, stable } = historyMessages(rows);
   return {
     questionId,
-    history: historyMessages(rows),
+    history,
+    stableHistory: stable,
     earlierQuestions: rows.filter((r) => r.role === 'user').map((r) => r.content)
   };
 }
@@ -202,8 +207,14 @@ function renderAnswer(a: StoredMessage, recent: boolean): string {
  * Every earlier question, each followed by its answer, as alternating turns. A question
  * with no saved answer (its run errored, or is still running) gets a placeholder, so the
  * turns still alternate and the model is not left guessing what was said.
+ *
+ * `stable` counts the leading messages that every later ask on this thread will render
+ * byte for byte the same, which is what lets a prompt cache reuse them: older answers are
+ * already cut short, and a question whose run has outlived the longest cap will never get
+ * its answer. The recent answers (cut shorter once newer ones arrive) and a question still
+ * running are not stable, nor is anything after them.
  */
-export function historyMessages(rows: StoredMessage[]): Anthropic.MessageParam[] {
+export function historyMessages(rows: StoredMessage[]): { messages: Anthropic.MessageParam[]; stable: number } {
   const answers = new Map<string, StoredMessage>();
   for (const r of rows) if (r.role === 'assistant' && r.replyTo) answers.set(r.replyTo, r);
   const questions = rows.filter((r) => r.role === 'user');
@@ -213,12 +224,17 @@ export function historyMessages(rows: StoredMessage[]): Anthropic.MessageParam[]
       .slice(-RECENT_ANSWERS)
       .map((q) => q._id)
   );
+  const settled = Date.now() - UNANSWERED_FINAL_MS;
+  const firstUnstable = questions.findIndex((q) =>
+    answers.has(q._id) ? recent.has(q._id) : new Date(q.createdAt).getTime() > settled
+  );
 
-  return questions.flatMap((q): Anthropic.MessageParam[] => {
+  const messages = questions.flatMap((q): Anthropic.MessageParam[] => {
     const a = answers.get(q._id);
     return [
       { role: 'user', content: clip(q.content, QUESTION_CHARS) },
       { role: 'assistant', content: a ? renderAnswer(a, recent.has(q._id)) : '(No answer was saved for this question.)' }
     ];
   });
+  return { messages, stable: 2 * (firstUnstable === -1 ? questions.length : firstUnstable) };
 }

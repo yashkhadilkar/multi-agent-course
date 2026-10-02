@@ -47,7 +47,12 @@ export const env = {
   // benchmark/sla.json (cost_model), so the agent and the bench price a run the same way.
   llmInputUsdPerMtok: num(process.env.LLM_INPUT_USD_PER_MTOK, 3.0),
   llmOutputUsdPerMtok: num(process.env.LLM_OUTPUT_USD_PER_MTOK, 15.0),
+  // Prompt caching: a 5-minute cache write is 1.25x the input rate, a cache read 0.1x.
+  llmCacheWriteUsdPerMtok: num(process.env.LLM_CACHE_WRITE_USD_PER_MTOK, 1.25 * num(process.env.LLM_INPUT_USD_PER_MTOK, 3.0)),
+  llmCacheReadUsdPerMtok: num(process.env.LLM_CACHE_READ_USD_PER_MTOK, 0.1 * num(process.env.LLM_INPUT_USD_PER_MTOK, 3.0)),
   searchUsdPerCall: num(process.env.SEARCH_USD_PER_CALL, 0.008),
+  /** sla.json max_cost_per_answer_usd: a quick run makes no extra model call that would take it past this. */
+  maxCostPerAnswerUsd: num(process.env.MAX_COST_PER_ANSWER_USD, 0.05),
 
   embeddingModel: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
 

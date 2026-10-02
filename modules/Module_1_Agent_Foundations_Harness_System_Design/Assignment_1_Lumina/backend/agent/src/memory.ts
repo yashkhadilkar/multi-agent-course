@@ -99,8 +99,20 @@ async function nearestFresh(userId: string, vector: number[], limit: number): Pr
 
 // ---------------------------------------------------------------- recall
 
-/** The memories to put in front of the model for this question, inside both caps. */
+/**
+ * Whether the user has saved anything at all. One indexed read ({userId, createdAt}), read
+ * from the collection rather than the vector index, so a row saved a second ago counts.
+ */
+async function hasMemories(userId: string): Promise<boolean> {
+  return (await (await memories()).findOne({ userId }, { projection: { _id: 1 } })) !== null;
+}
+
+/**
+ * The memories to put in front of the model for this question, inside both caps. A user with
+ * nothing saved costs one indexed read: no embedding call, no vector search.
+ */
 export async function recallMemories(userId: string, query: string, signal?: AbortSignal): Promise<RecalledMemory[]> {
+  if (!(await hasMemories(userId))) return [];
   const vector = await embedOne(query, signal);
   const ranked = await nearestFresh(userId, vector, RECALL_LIMIT);
   const kept: RecalledMemory[] = [];

@@ -43,6 +43,7 @@ import { cachedSearch, isTimeSensitive } from './cache.js';
 import { env } from './env.js';
 import { recallMemories, type RecalledMemory } from './memory.js';
 import { selectPassages, unwrap } from './passages.js';
+import { addMessageUsage, costUsd, emptyUsage, inputTokens } from './pricing.js';
 import { llm, memoryNote, normUrl, retrievalFor, where, type QuickAsk, type Retrieval } from './quick.js';
 import { DocumentSearchError, searchDocuments } from './retrieval.js';
 import { recordAnswer } from './runlog.js';
@@ -131,7 +132,9 @@ function answerSystem(retrieval: Retrieval, subQuestions: number): string {
   const from = retrieval === 'docs' ? "the user's documents" : retrieval === 'both' ? "the web and the user's documents" : 'the web';
   return `You are LUMINA in deep research mode. The user's question was split into sub-questions, each researched on ${from}, and you write the one answer from the passages that were read. Today is ${today}.
 
-Structure, in plain text with no Markdown (no #, no **, no tables):
+Write plain text, not Markdown. The answer is shown exactly as written, so Markdown symbols appear as literal characters: no asterisks or underscores for bold or italics, no # before headings, no tables, no backticks.
+
+Structure:
 1. First, with no heading, the direct answer to the whole question in two or three sentences, at most ${OPENING_WORDS} words.
 2. Then one section per sub-question, in plan order, each at most ${perSection} words. Each starts with a short heading of a few words on its own line, followed by a short paragraph or a few lines starting with "- ". Separate sections with a blank line.
 3. Last, a section headed "What is still unknown", at most ${UNKNOWN_WORDS} words: what the sources did not settle, disagreed on, or did not cover, specific to this question. If a sub-question had nothing read for it, say so here.
@@ -183,7 +186,7 @@ export async function runDeep(ask: DeepAsk, res: Response, log: Logger): Promise
 
   /** Pushed as calls finish. `sub` is 0 for the steps that serve the whole question. */
   const calls: { step: number; sub: number; call: RunLog['toolCalls'][number] }[] = [];
-  const usage = { in: 0, out: 0, searches: 0, extracts: 0 };
+  const usage = emptyUsage();
   const cache = { searches: 0, hits: 0, readErrors: 0 };
   const freshQuestion = isTimeSensitive(ask.query);
 
@@ -316,8 +319,7 @@ export async function runDeep(ask: DeepAsk, res: Response, log: Logger): Promise
         },
         { signal: abort.signal }
       );
-      usage.in += msg.usage.input_tokens + (msg.usage.cache_creation_input_tokens ?? 0) + (msg.usage.cache_read_input_tokens ?? 0);
-      usage.out += msg.usage.output_tokens;
+      addMessageUsage(usage, msg.usage);
       if (msg.stop_reason === 'refusal') throw new ModelRefusal('llm provider: the model declined to plan (refusal)');
       const parsed = parsePlan(msg.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join(''));
       const raw = parsed.questions;
@@ -648,8 +650,7 @@ export async function runDeep(ask: DeepAsk, res: Response, log: Logger): Promise
       if (ev.type === 'content_block_delta' && ev.delta.type === 'text_delta') write(ev.delta.text);
     }
     const msg = await stream.finalMessage();
-    usage.in += msg.usage.input_tokens + (msg.usage.cache_creation_input_tokens ?? 0) + (msg.usage.cache_read_input_tokens ?? 0);
-    usage.out += msg.usage.output_tokens;
+    addMessageUsage(usage, msg.usage);
     if (msg.stop_reason === 'refusal') throw new ModelRefusal('llm provider: the model declined to answer (refusal)');
     emit(filter!.flush());
     if (msg.stop_reason === 'max_tokens') {
@@ -717,17 +718,13 @@ export async function runDeep(ask: DeepAsk, res: Response, log: Logger): Promise
 
   function measure(): DoneEvent {
     const latencyMs = Date.now() - started;
-    const costUsd =
-      (usage.in * env.llmInputUsdPerMtok + usage.out * env.llmOutputUsdPerMtok) / 1e6 +
-      usage.searches * env.searchUsdPerCall +
-      usage.extracts * (env.searchUsdPerCall / 5);
     return {
       answerId,
       latencyMs,
       ttftMs: ttftMs ?? latencyMs,
       model: env.llmModel,
-      tokens: { in: usage.in, out: usage.out },
-      costUsd: Math.round(costUsd * 1e6) / 1e6,
+      tokens: { in: inputTokens(usage), out: usage.out },
+      costUsd: Math.round(costUsd(usage) * 1e6) / 1e6,
       searchCached: cache.searches > 0 && cache.hits === cache.searches,
       terminated,
       depth: 'deep',
@@ -741,7 +738,7 @@ export async function runDeep(ask: DeepAsk, res: Response, log: Logger): Promise
     // the whole-question steps first, then each sub-question's steps together, in step
     // order within each: every sub-question's trajectory reads as it ran.
     const runLog: RunLog = {
-      tokens: usage.in + usage.out,
+      tokens: inputTokens(usage) + usage.out,
       wallClockSec: latencyMs / 1000,
       costUsd: done.costUsd,
       terminated,

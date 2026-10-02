@@ -214,7 +214,7 @@ app.post(
     }
 
     // The question is saved whatever the run's outcome; the answer only if it ends done or cap.
-    const { questionId, history, earlierQuestions } = await beginTurn(userId, threadId, ask.query);
+    const { questionId, history, stableHistory, earlierQuestions } = await beginTurn(userId, threadId, ask.query);
     // The gear the client asked for, never another: quick has no path to plan_research.
     await (ask.depth === 'deep' ? runDeep : runQuick)(
       {
@@ -225,6 +225,7 @@ app.post(
         mode: ask.mode,
         space,
         history,
+        stableHistory,
         earlierQuestions,
         saveAnswer: (answer) => saveAnswer(userId, threadId, questionId, answer)
       },

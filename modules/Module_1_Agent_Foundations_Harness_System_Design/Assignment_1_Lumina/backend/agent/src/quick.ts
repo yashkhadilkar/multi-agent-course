@@ -52,6 +52,7 @@ import { cachedSearch, isTimeSensitive } from './cache.js';
 import { env, secrets } from './env.js';
 import { MAX_MEMORY_CHARS, recallMemories, saveMemory, type RecalledMemory } from './memory.js';
 import { selectPassages, unwrap } from './passages.js';
+import { addMessageUsage, costUsd, emptyUsage, inputTokens, llmCostUsd, toolCostUsd } from './pricing.js';
 import { DocumentSearchError, searchDocuments, type SpaceContents } from './retrieval.js';
 import { recordAnswer } from './runlog.js';
 import { FetchError, SearchProviderError, hostOf, type SearchResult } from './search.js';
@@ -59,8 +60,11 @@ import { CitationFilter, SseStream } from './sse.js';
 import type { SavedAnswer } from './threads.js';
 import { chooseSnippet, choiceNote, readWithPlain, type PlainPage } from './verify.js';
 
-/** Words of each fetched page the model reads. Four pages of this stay well inside quick's cost budget. */
-const PAGE_WORDS = 700;
+/**
+ * Words of each fetched page the model reads: its most relevant passages. Every word is input
+ * on the path to the first token, and an answer runs about 150 words.
+ */
+const PAGE_WORDS = 500;
 /** Research stops starting new turns this long before the wall-clock cap, to leave room to answer. */
 const ANSWER_RESERVE_MS = 15_000;
 /** Thinking counts against this too. It bounds the cost of any one turn. */
@@ -68,10 +72,24 @@ const MAX_TOKENS_PER_TURN = 2048;
 /** How many of the first search's results are read before the model is called. */
 const PREFETCH_PAGES = 3;
 /**
+ * The up-front reads stop waiting once this many pages are in and citable, giving the rest
+ * PREFETCH_GRACE_MS more. Waiting for the slowest of three put that one publisher on the path
+ * to the first token; a read it stops is traced as failed, and fetch_page can retry it.
+ */
+const PREFETCH_ENOUGH = 2;
+const PREFETCH_GRACE_MS = 200;
+/**
  * With pages in hand the model may answer at once, or open with a preamble and then call a
  * tool. Its text is committed as the answer once it cites a source or runs this long.
  */
 const COMMIT_AFTER_CHARS = 160;
+/**
+ * The cost guard's estimates (extraRoundFits). Output per call: a quick answer runs 100 to
+ * 600 tokens, a tool call 200 to 250. Tool results: a search's five results, a page's
+ * PAGE_WORDS, search_documents' top five chunks.
+ */
+const EST_OUTPUT_TOKENS = 600;
+const EST_RESULT_TOKENS: Record<string, number> = { web_search: 600, fetch_page: 800, search_documents: 1500, save_memory: 50 };
 
 // ---------------------------------------------------------------- tools
 
@@ -240,6 +258,7 @@ Memory:
 
 How to answer:
 - Put the direct answer in the first sentence, then only what the question needs. Keep it under about 150 words unless the question asks for depth; no headings for a short answer.
+- Write plain text, not Markdown. The answer is shown exactly as written, so Markdown symbols appear as literal characters: no asterisks or underscores for bold or italics, no # headings, no tables, no backticks. For a list, put each item on its own line starting with "- ".
 - Each page and each document passage you read has a source number. Cite a claim by putting that number in square brackets right after it, like this [2]. One number per bracket: [1][3], never [1, 3].
 - Cite only the source numbers given with what you read. Web search results are not sources.
 - Make claims only from the passages you read. If they do not answer the question, say that plainly instead of guessing.
@@ -264,6 +283,8 @@ export type QuickAsk = {
   space: SpaceContents | null;
   /** Earlier turns of the thread, already trimmed, as alternating user/assistant messages. */
   history: Anthropic.MessageParam[];
+  /** How many leading messages of `history` every later ask renders the same: the cacheable part. */
+  stableHistory: number;
   /** The thread's earlier questions, whole and oldest first, for a follow-up's first search. */
   earlierQuestions: string[];
   /** Persists a done or capped answer. Runs before `done` is sent; a throw ends the run as an error. */
@@ -317,6 +338,20 @@ export function refersBack(query: string): boolean {
   });
 }
 
+/** "Remember that…", "From now on…", "Going forward…", "Keep in mind…", "Don't forget…", "Note that…". */
+const REMEMBER_OPENER =
+  /^\s*(?:please\s+)?(?:remember\b|from now on\b|going forward\b|keep in mind\b|don'?t forget\b|do not forget\b|note that\b|for (?:all )?future (?:answers|questions|conversations)\b)/i;
+
+/**
+ * Whether a message only asks to remember something: it opens like a memory request and
+ * asks no question. Such a message skips the up-front search, which would read three pages
+ * about the preference itself. The model keeps its search tools, so a message that also
+ * wants something looked up can still have it.
+ */
+export function onlyAsksToRemember(query: string): boolean {
+  return REMEMBER_OPENER.test(query) && !query.includes('?');
+}
+
 /**
  * The first search for a follow-up that points back: the latest earlier question that names
  * its own subject, then this one. Pairing with the previous question alone fails on a chain
@@ -364,7 +399,27 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   /** Calls the thrash guard refused. Traced, but not in the run log, since they never ran. */
   const refused: { step: number; tool: ToolName }[] = [];
   // `searches` is provider calls, the ones that cost money; a cache hit is not one.
-  const usage = { in: 0, out: 0, searches: 0, extracts: 0 };
+  const usage = emptyUsage();
+  /** Set when the cost guard stopped a round of tools, with what it projected. */
+  let costStop = null as { projectedUsd: number; tools: string[] } | null;
+  /** Where the time before the first token went, in ms from the start of the run. Logged with the answer. */
+  const timing = {
+    firstStepMs: null as number | null,
+    readsMs: null as number | null,
+    turns: [] as {
+      mode: 'auto' | 'answer';
+      startMs: number;
+      firstThinkingMs: number | null;
+      firstTextMs: number | null;
+      endMs: number;
+      in: number;
+      cacheRead: number;
+      cacheWrite: number;
+      out: number;
+      stop: string | null;
+    }[]
+  };
+  const since = () => Date.now() - started;
   const cache = { searches: 0, hits: 0, readErrors: 0 };
   // A time-sensitive question keeps every search in the run fresh, not only the ones
   // whose own wording says so: the model's follow-up queries may drop the "latest".
@@ -450,12 +505,13 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
    * batch, and every call settles, tracing its step, before that first error goes on to end
    * the run. A plain Promise.all would record the run while its siblings were still in flight.
    */
-  async function settleBatch<T>(calls: ((batch: AbortSignal) => Promise<T>)[]): Promise<T[]> {
+  async function settleBatch<T>(calls: ((batch: AbortSignal) => Promise<T>)[], parent?: AbortSignal): Promise<T[]> {
     const batch = new AbortController();
+    const signal = parent ? AbortSignal.any([parent, batch.signal]) : batch.signal;
     let failure = null as { reason: unknown } | null;
     const settled = await Promise.allSettled(
       calls.map((call) =>
-        call(batch.signal).catch((reason: unknown) => {
+        call(signal).catch((reason: unknown) => {
           if (!failure) {
             failure = { reason };
             batch.abort(new Error(`cancelled because a parallel call failed: ${(reason as Error).message || 'unknown error'}`));
@@ -567,6 +623,13 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       const timedOut = err instanceof DOMException && err.name === 'TimeoutError';
       const error = timedOut ? `timed out after ${timeoutMs}ms` : err instanceof FetchError ? err.message : (err as Error).message;
       return fail({ url }, reason, error || 'fetch failed');
+    }
+    // Stopped from outside after the read but before its plain-HTML check finished: the
+    // check never ran, so the page is not kept as though it had been unverifiable.
+    const stopped = cutShort(batch);
+    if (stopped) {
+      trace(s, 'fetch_page', { url }, t0, { ok: false, reason, error: stopped });
+      throw (abort.signal.aborted ? abort.signal.reason : batch!.reason) as Error;
     }
 
     const sel = selectPassages(text, [ask.query, ...searchQueries].join(' '), PAGE_WORDS);
@@ -752,6 +815,101 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     );
   }
 
+  /**
+   * The up-front reads of the first search's top results, in parallel. Steps are reserved in
+   * rank order before any await. Once PREFETCH_ENOUGH pages are in and citable, the rest get
+   * PREFETCH_GRACE_MS, then are stopped: each is traced as a failed step with why, and the
+   * model is told it can retry. Anything else that stops them (the run, a failed sibling in
+   * `parent`) still ends the run.
+   */
+  async function prefetch(top: SearchResult[], parent: AbortSignal): Promise<{ content: string; isError: boolean }[]> {
+    const enough = new AbortController();
+    const signal = AbortSignal.any([parent, enough.signal]);
+    let kept = 0;
+    let grace: NodeJS.Timeout | undefined;
+    const stopRest = () =>
+      enough.abort(new Error(`not waited for: ${PREFETCH_ENOUGH} pages were already read when it had not finished`));
+    try {
+      return await Promise.all(
+        top.map((r) => {
+          const s = reserve('fetch_page');
+          return runFetchPage(s, { url: r.url, reason: 'top result, read up front' }, env.prefetchTimeoutMs, signal).then(
+            (res) => {
+              if (!res.isError && ++kept === PREFETCH_ENOUGH && kept < top.length) grace = setTimeout(stopRest, PREFETCH_GRACE_MS);
+              return res;
+            },
+            (err: unknown) => {
+              // Stopped because enough pages were in: a failed read, already traced. Anything else ends the run.
+              if (parent.aborted || !enough.signal.aborted) throw err;
+              return { content: `Error: ${(enough.signal.reason as Error).message}`, isError: true };
+            }
+          );
+        })
+      );
+    } finally {
+      clearTimeout(grace);
+    }
+  }
+
+  // ---------------------------------------------------------------- prompt caching
+
+  /**
+   * Cache breakpoints, at most three, each where the prefix before it is reused by a later
+   * request (Sonnet 5 caches a prefix of 1,024 tokens or more):
+   *   1. the system prompt, which caches the tools with it: the same for every quick run in
+   *      this mode, so after the first run in five minutes every call reads it at 0.1x;
+   *   2. the end of the thread history that later asks render byte for byte the same
+   *      (threads.ts `stable`), so each follow-up reads the thread so far and writes only
+   *      the turn that just became stable;
+   *   3. the end of the conversation, only from a run's second model call on, when a call
+   *      in auto mode may still be followed by another.
+   * The first call's own question message (search results and pages) is not cached: it is
+   * reused only if the run needs a second call, about 3% of quick runs, and writing it costs
+   * 1.25x on every run. Measured on Sonnet 5, a forced-answer call (tool_choice none) still
+   * read 1 and 2; the cost guard prices it uncached anyway, so its estimate errs high.
+   */
+  const cachedSystem: Anthropic.TextBlockParam[] = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }];
+
+  function withBreakpoints(tail: boolean): Anthropic.MessageParam[] {
+    const marks = new Set<number>();
+    if (ask.stableHistory > 0) marks.add(ask.stableHistory - 1);
+    if (tail) marks.add(messages.length - 1);
+    return messages.map((m, i) => {
+      if (!marks.has(i)) return m;
+      const blocks = typeof m.content === 'string' ? [{ type: 'text' as const, text: m.content }] : m.content;
+      const last = blocks.at(-1);
+      if (!last || last.type === 'thinking' || last.type === 'redacted_thinking') return m;
+      return { ...m, content: [...blocks.slice(0, -1), { ...last, cache_control: { type: 'ephemeral' } }] } as Anthropic.MessageParam;
+    });
+  }
+
+  // ---------------------------------------------------------------- cost guard
+
+  /**
+   * Before a model call beyond the first, decides whether the round of tools the model just
+   * asked for, the call that reads their results, and one more call to answer after that
+   * (reserved, since that call may ask for tools again) can all fit inside the per-answer
+   * budget. If not, the tools are not run and the model answers from what it already has.
+   * Estimates err high: searches priced as cache misses, tool results at their usual size,
+   * every call's output at EST_OUTPUT_TOKENS.
+   */
+  function extraRoundFits(uses: Anthropic.ToolUseBlock[], last: Anthropic.Message): { fits: boolean; projectedUsd: number } {
+    const count = (name: string) => uses.filter((u) => u.name === name).length;
+    const toolsUsd = toolCostUsd({
+      searches: count('web_search'),
+      extracts: env.searchProvider === 'tavily' ? count('fetch_page') : 0
+    });
+    const lastIn = last.usage.input_tokens + (last.usage.cache_creation_input_tokens ?? 0) + (last.usage.cache_read_input_tokens ?? 0);
+    const cached = (last.usage.cache_read_input_tokens ?? 0) + (last.usage.cache_creation_input_tokens ?? 0);
+    const nextIn = lastIn + last.usage.output_tokens + uses.reduce((n, u) => n + (EST_RESULT_TOKENS[u.name] ?? 1000), 0);
+    // The next call reads what is cached and writes the rest (breakpoint 3); the reserved
+    // answer call reads only the tools and system prompt, so it is priced uncached.
+    const nextUsd = llmCostUsd({ in: 0, cacheRead: cached, cacheWrite: nextIn - cached, out: EST_OUTPUT_TOKENS });
+    const answerUsd = llmCostUsd({ in: nextIn + EST_OUTPUT_TOKENS, cacheRead: 0, cacheWrite: 0, out: EST_OUTPUT_TOKENS });
+    const projectedUsd = costUsd(usage) + toolsUsd + nextUsd + answerUsd;
+    return { fits: projectedUsd <= env.maxCostPerAnswerUsd, projectedUsd: Math.round(projectedUsd * 1e6) / 1e6 };
+  }
+
   // ---------------------------------------------------------------- one model turn
 
   /**
@@ -762,16 +920,20 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
    * `held` is text from a turn that ended with nothing citable, for the caller to decide on.
    */
   async function turn(mode: 'auto' | 'answer'): Promise<{ msg: Anthropic.Message; held: string }> {
+    const startMs = since();
+    let firstThinkingMs = null as number | null;
+    let firstTextMs = null as number | null;
     const stream = llm().messages.stream(
       {
         model: env.llmModel,
         max_tokens: MAX_TOKENS_PER_TURN,
-        system,
+        system: cachedSystem,
         tools,
         tool_choice: { type: mode === 'answer' ? 'none' : 'auto' },
         thinking: { type: 'adaptive' },
         output_config: { effort: 'low' },
-        messages
+        // The tail is cached only once a run is already on a later call and may make another.
+        messages: withBreakpoints(mode === 'auto' && timing.turns.length > 0)
       },
       { signal: abort.signal }
     );
@@ -785,7 +947,9 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     let sawToolUse = false;
     for await (const ev of stream) {
       if (ev.type === 'content_block_start' && ev.content_block.type === 'tool_use') sawToolUse = true;
+      if (ev.type === 'content_block_start' && ev.content_block.type === 'thinking') firstThinkingMs ??= since();
       if (ev.type !== 'content_block_delta' || ev.delta.type !== 'text_delta') continue;
+      firstTextMs ??= since();
       if (sources) write(ev.delta.text);
       else {
         held += ev.delta.text;
@@ -804,8 +968,19 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       write(held);
       held = '';
     }
-    usage.in += msg.usage.input_tokens + (msg.usage.cache_creation_input_tokens ?? 0) + (msg.usage.cache_read_input_tokens ?? 0);
-    usage.out += msg.usage.output_tokens;
+    addMessageUsage(usage, msg.usage);
+    timing.turns.push({
+      mode,
+      startMs,
+      firstThinkingMs,
+      firstTextMs,
+      endMs: since(),
+      in: msg.usage.input_tokens,
+      cacheRead: msg.usage.cache_read_input_tokens ?? 0,
+      cacheWrite: msg.usage.cache_creation_input_tokens ?? 0,
+      out: msg.usage.output_tokens,
+      stop: msg.stop_reason
+    });
     if (msg.stop_reason === 'refusal') throw new ModelRefusal('llm provider: the model declined to answer (refusal)');
     return { msg, held };
   }
@@ -817,66 +992,81 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     // ---- step one, no model: search the question as asked, read the top results. A
     // follow-up that points back ("does it…") is searched with the question before it.
     // Docs mode searches the Space instead of the web; auto with a Space searches both, and
-    // the model decides what to use. Recall runs alongside: none of these needs another, so
-    // running them together costs no time to first token.
+    // the model decides what to use. Recall runs alongside, and the reads start the moment
+    // the web search returns, without waiting on recall or the document search: the first
+    // token waits only for the slowest of the three branches.
     const withContext = firstSearchQuery(ask);
     const firstQuery = withContext ?? ask.query.slice(0, 400);
     const asAsked = withContext ? 'the follow-up, with the earlier question it refers back to' : 'the question as asked';
+    // A message that only asks to remember something is not searched up front, on the web or
+    // in the Space: the model saves it and confirms, and keeps its tools in case it asks more.
+    const rememberOnly = onlyAsksToRemember(ask.query);
     const recallStep = reserve('recall_memory');
-    const webStep = retrieval === 'docs' ? null : reserve('web_search');
-    const docsStep = retrieval === 'web' ? null : reserve('search_documents');
+    const webStep = retrieval === 'docs' || rememberOnly ? null : reserve('web_search');
+    const docsStep = retrieval === 'web' || rememberOnly ? null : reserve('search_documents');
     const docsReason =
       retrieval === 'docs'
         ? `docs mode: ${asAsked}, in the Space only`
         : `auto mode with a Space selected: ${asAsked}, in the documents alongside the web`;
-    const [recalled, first, docs] = (await settleBatch<unknown>([
+    type FirstWeb = { found: Awaited<ReturnType<typeof runWebSearch>>; top: SearchResult[]; reads: { content: string; isError: boolean }[] };
+    const [recalled, web, docs] = (await settleBatch<unknown>([
       (batch) => runRecall(recallStep, withContext ?? ask.query, batch),
-      async (batch) => (webStep === null ? null : runWebSearch(webStep, { query: firstQuery, reason: asAsked }, batch)),
+      async (batch): Promise<FirstWeb | null> => {
+        if (webStep === null) return null;
+        const found = await runWebSearch(webStep, { query: firstQuery, reason: asAsked }, batch);
+        timing.firstStepMs = since();
+        // Reserved per result in prefetch, in rank order. These count toward the thrash
+        // guard's streak like any fetch_page the model makes.
+        const top = found.results.slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
+        const reads = await prefetch(top, batch);
+        timing.readsMs = since();
+        return { found, top, reads };
+      },
       async (batch) => (docsStep === null ? null : runSearchDocuments(docsStep, { query: firstQuery }, docsReason, batch))
-    ])) as [
-      Awaited<ReturnType<typeof runRecall>>,
-      Awaited<ReturnType<typeof runWebSearch>> | null,
-      Awaited<ReturnType<typeof runSearchDocuments>> | null
-    ];
-    const top = (first?.results ?? []).slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
-    // Reserved synchronously per result, so steps are numbered in rank order. These count
-    // toward the thrash guard's streak like any fetch_page the model makes.
-    const reads = await settleBatch(
-      top.map((r) => {
-        const s = reserve('fetch_page');
-        return (batch: AbortSignal) =>
-          runFetchPage(s, { url: r.url, reason: 'top result, read up front' }, env.prefetchTimeoutMs, batch);
-      })
-    );
+    ])) as [Awaited<ReturnType<typeof runRecall>>, FirstWeb | null, Awaited<ReturnType<typeof runSearchDocuments>> | null];
+    const first = web?.found ?? null;
+    const top = web?.top ?? [];
+    const reads = web?.reads ?? [];
     const read = reads.filter((r) => !r.isError).map((r) => r.content);
     const unread = top.flatMap((r, i) => (reads[i]?.isError ? [`${r.url} (${reads[i]!.content.replace(/^Error: /, '')})`] : []));
+    const left = `${step} of ${env.maxToolCalls} tool calls used, ${Math.max(0, env.maxToolCalls - step)} left`;
     messages.push({
       role: 'user',
-      content: [
-        ask.query,
-        '---',
-        memoryNote(recalled),
-        `The question was searched ${retrieval === 'docs' ? "in the user's documents " : retrieval === 'both' ? "on the web and in the user's documents " : ''}${withContext ? 'together with the earlier question it refers back to' : 'as asked'} (${step} of ${env.maxToolCalls} tool calls used, ${Math.max(0, env.maxToolCalls - step)} left).`,
-        docs
-          ? docs.found
-            ? `Passages from the documents in "${space!.name}", cite them by their source number:\n\n${docs.content}`
-            : `Document search: ${docs.content}`
-          : '',
-        first ? `Web search results:\n${first.content}` : '',
-        read.length ? `Web pages read, cite them by their source number:\n\n${read.join('\n\n---\n\n')}` : '',
-        unread.length ? `Not read in time (fetch_page can retry with a longer timeout):\n${unread.join('\n')}` : '',
-        // Searched on its own words: right for a new topic, wrong for a follow-up the heuristic missed.
-        ask.history.length && !withContext
-          ? 'If this question continues the conversation and these results miss what it is about, search again with that spelled out.'
-          : '',
-        retrieval === 'both'
-          ? 'Use the documents, the web, or both, whichever the question needs. If what you have answers it, answer now. If not, search again or read more.'
-          : retrieval === 'docs'
-            ? 'If the passages answer the question, answer now. If not, search the documents again with different wording.'
-            : 'If the pages answer the question, answer now. If not, search again or read more results.'
-      ]
-        .filter(Boolean)
-        .join('\n\n')
+      content: rememberOnly
+        ? [
+            ask.query,
+            '---',
+            memoryNote(recalled),
+            `Nothing was searched up front: this message reads as only asking you to remember something (${left}).`,
+            'Save what it asks you to remember with save_memory, then confirm in a sentence. If it also asks for something to be looked up, search for that before answering.'
+          ]
+            .filter(Boolean)
+            .join('\n\n')
+        : [
+            ask.query,
+            '---',
+            memoryNote(recalled),
+            `The question was searched ${retrieval === 'docs' ? "in the user's documents " : retrieval === 'both' ? "on the web and in the user's documents " : ''}${withContext ? 'together with the earlier question it refers back to' : 'as asked'} (${left}).`,
+            docs
+              ? docs.found
+                ? `Passages from the documents in "${space!.name}", cite them by their source number:\n\n${docs.content}`
+                : `Document search: ${docs.content}`
+              : '',
+            first ? `Web search results:\n${first.content}` : '',
+            read.length ? `Web pages read, cite them by their source number:\n\n${read.join('\n\n---\n\n')}` : '',
+            unread.length ? `Not read in time (fetch_page can retry with a longer timeout):\n${unread.join('\n')}` : '',
+            // Searched on its own words: right for a new topic, wrong for a follow-up the heuristic missed.
+            ask.history.length && !withContext
+              ? 'If this question continues the conversation and these results miss what it is about, search again with that spelled out.'
+              : '',
+            retrieval === 'both'
+              ? 'Use the documents, the web, or both, whichever the question needs. If what you have answers it, answer now. If not, search again or read more.'
+              : retrieval === 'docs'
+                ? 'If the passages answer the question, answer now. If not, search the documents again with different wording.'
+                : 'If the pages answer the question, answer now. If not, search again or read more results.'
+          ]
+            .filter(Boolean)
+            .join('\n\n')
     });
 
     let mode: 'auto' | 'answer' = 'auto';
@@ -892,16 +1082,31 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       const uses = msg.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use');
       if (uses.length) {
         messages.push({ role: 'assistant', content: msg.content });
-        const results = await runTools(uses);
+        // The cost guard, before another model call is committed to.
+        const guard = extraRoundFits(uses, msg);
+        let results: Anthropic.ToolResultBlockParam[];
+        if (guard.fits) results = await runTools(uses);
+        else {
+          capped = true;
+          costStop = { projectedUsd: guard.projectedUsd, tools: uses.map((u) => u.name) };
+          log.info({ requestId: ask.requestId, ...costStop, budgetUsd: env.maxCostPerAnswerUsd }, 'cost guard: answering without another round of tools');
+          results = uses.map((u) => ({
+            type: 'tool_result',
+            tool_use_id: u.id,
+            content: `Error: not run. Another round of research would take this answer past its $${env.maxCostPerAnswerUsd} cost budget.`,
+            is_error: true
+          }));
+        }
         const content: Anthropic.ContentBlockParam[] = [...results];
         const timeLow = Date.now() > deadline - ANSWER_RESERVE_MS;
         mode = 'auto';
         if (capped || timeLow) {
           capped = true;
           mode = 'answer';
+          const spent = timeLow ? 'time' : costStop ? 'cost' : `${env.maxToolCalls} tool calls`;
           content.push({
             type: 'text',
-            text: `The research budget for this search is spent (${timeLow ? 'time' : `${env.maxToolCalls} tool calls`}). Write the answer now from the pages already read, and say in one sentence that the research stopped early.`
+            text: `The research budget for this search is spent (${spent}). Write the answer now from what was already read, and say in one sentence that the research stopped early.`
           });
         }
         messages.push({ role: 'user', content });
@@ -1004,18 +1209,14 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
 
   function measure(): DoneEvent {
     const latencyMs = Date.now() - started;
-    const costUsd =
-      (usage.in * env.llmInputUsdPerMtok + usage.out * env.llmOutputUsdPerMtok) / 1e6 +
-      usage.searches * env.searchUsdPerCall +
-      // Tavily bills extract at one credit per five pages, a fifth of a search.
-      usage.extracts * (env.searchUsdPerCall / 5);
     return {
       answerId,
       latencyMs,
       ttftMs: ttftMs ?? latencyMs,
       model: env.llmModel,
-      tokens: { in: usage.in, out: usage.out },
-      costUsd: Math.round(costUsd * 1e6) / 1e6,
+      // Every input token, cached or not; cache reads and writes differ only in price.
+      tokens: { in: inputTokens(usage), out: usage.out },
+      costUsd: Math.round(costUsd(usage) * 1e6) / 1e6,
       // Only when every search in the request hit. No search at all is not a hit.
       searchCached: cache.searches > 0 && cache.hits === cache.searches,
       terminated,
@@ -1029,7 +1230,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     const { latencyMs } = done;
     // The run log in the quality kit's shape: the same object is logged and stored.
     const runLog: RunLog = {
-      tokens: usage.in + usage.out,
+      tokens: inputTokens(usage) + usage.out,
       wallClockSec: latencyMs / 1000,
       costUsd: done.costUsd,
       terminated,
@@ -1058,6 +1259,9 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         sources: sources?.length ?? 0,
         snippetFallback,
         droppedCitations: filter?.dropped ?? [],
+        promptCache: { read: usage.cacheRead, write: usage.cacheWrite, uncached: usage.in },
+        costStop,
+        timing,
         ...extra,
         runLog
       },
