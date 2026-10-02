@@ -32,6 +32,12 @@ const log = pino({ level: env.logLevel });
 const app = express();
 
 app.disable('x-powered-by');
+
+// Liveness for Fly's check: this process is up and serving HTTP, nothing more. It never
+// calls the agent, so a dead agent cannot get a healthy gateway pulled from routing. Ahead
+// of the request log so a check every 15 s is not a log line. /health is the full report.
+app.get('/livez', (_req, res) => void res.type('text/plain').send('ok'));
+
 app.use(
   cors({
     origin: env.corsOrigins,

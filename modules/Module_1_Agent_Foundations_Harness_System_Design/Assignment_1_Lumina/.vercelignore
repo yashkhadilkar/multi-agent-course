@@ -1,0 +1,19 @@
+# What `vercel deploy` uploads from this folder: only what web/ needs to build (the web
+# app, the contract it imports, and the workspace manifests npm ci checks), plus the
+# project config in vercel.json. Everything else, .env above all, stays on this machine.
+#
+# vercel.json lives here rather than in web/ because the upload root is this folder: the
+# workspace build needs packages/contract. Vercel reads the root vercel.json, not
+# web/vercel.json, so the root file repeats web's SPA fallback; /evals loads on a direct hit.
+/*
+!/vercel.json
+!/web
+!/packages
+!/backend
+!/package.json
+!/package-lock.json
+!/tsconfig.base.json
+/backend/*/*
+!/backend/*/package.json
+**/node_modules
+**/dist

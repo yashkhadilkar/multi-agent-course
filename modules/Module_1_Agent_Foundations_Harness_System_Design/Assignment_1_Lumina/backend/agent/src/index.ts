@@ -55,6 +55,12 @@ const log = pino({ level: env.logLevel });
 const app = express();
 
 app.disable('x-powered-by');
+
+// Liveness for Fly's check: this process is up and serving HTTP, nothing more. It never
+// touches Mongo or the worker, so a dead dependency cannot get a healthy agent pulled or
+// restarted. /health below is the full status report.
+app.get('/livez', (_req, res) => void res.type('text/plain').send('ok'));
+
 app.use((req, res, next) =>
   req.path.endsWith('/documents') && req.method === 'POST'
     ? next()

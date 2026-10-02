@@ -1,0 +1,58 @@
+# LUMINA agent service + jobs worker. Deploy from this folder: fly deploy -c fly.agent.toml
+#
+# PRIVATE. There is no [http_service] or [[services]] here, so Fly's proxy routes nothing
+# to this app from the internet and no public IP is allocated. The agent holds the provider
+# keys and enforces DEEP_DAILY_CAP, so it must not be reachable except over Fly's private
+# network (6PN), where the gateway calls the `app` group at
+#   http://app.process.lumina-yk-agent.internal:8000
+# The `.process.` name matters: plain lumina-yk-agent.internal would also resolve to the
+# worker machine, which listens on nothing.
+#
+# Keys and agent config come from .env via `fly secrets import`, never from this file.
+
+app = "lumina-yk-agent"
+# The Fly region nearest the Atlas cluster in AWS us-west-2 (Oregon).
+primary_region = "sjc"
+
+[build]
+  dockerfile = "backend/agent/Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT_AGENT = "8000"
+
+# Same image, two processes (DESIGN.md, Components): parsing and embedding a large PDF on
+# the worker can never stall an answer stream on the agent.
+[processes]
+  app = "node dist/index.js"
+  worker = "node dist/worker.js"
+
+# Liveness only, and only on `app`. /health goes 503 when Mongo is down or the worker's
+# heartbeat is stale; checking that would take a healthy agent down with its dependencies.
+# A failing /livez means the HTTP server itself is wedged.
+[checks.alive]
+  type = "http"
+  port = 8000
+  method = "GET"
+  path = "/livez"
+  interval = "15s"
+  timeout = "2s"
+  grace_period = "10s"
+  processes = ["app"]
+
+# The worker has no port to check; if it exits, Fly starts it again. A worker that is alive
+# but stuck shows up as a stale heartbeat on /health instead.
+[[restart]]
+  policy = "always"
+  processes = ["app", "worker"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["app"]
+
+# pdfjs parsing and embedding batches are the memory-hungry part.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
+  processes = ["worker"]

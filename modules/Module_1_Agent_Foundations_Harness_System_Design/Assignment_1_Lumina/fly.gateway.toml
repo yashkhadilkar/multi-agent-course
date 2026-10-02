@@ -1,0 +1,49 @@
+# LUMINA gateway, the only public backend. Deploy from this folder: fly deploy -c fly.gateway.toml
+#
+# Holds no provider key and has no Fly secrets: everything it needs is below. It reaches
+# the private agent over Fly's 6PN network (see fly.agent.toml).
+
+app = "lumina-yk-gateway"
+# The Fly region nearest the Atlas cluster in AWS us-west-2 (Oregon), next to the agent.
+primary_region = "sjc"
+
+[build]
+  dockerfile = "backend/gateway/Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT_GATEWAY = "8787"
+  AGENT_URL = "http://app.process.lumina-yk-agent.internal:8000"
+  # The Vercel production URL. Server-side callers (the bench, the eval) send no Origin and
+  # are unaffected.
+  CORS_ORIGINS = "https://lumina-yk.vercel.app"
+  # DESIGN.md, Responsibilities: 120 per X-User-Id per minute on ask and upload.
+  RATE_LIMIT_PER_MINUTE = "120"
+  LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  # Graders hit the URL whenever they like; a sleeping machine scores what it shows.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  # An SSE answer is one long request; count requests, not connections.
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  # Liveness only. /health goes 503 whenever the agent is down; checking that would pull a
+  # healthy gateway out of routing, and the UI could not even show it as degraded.
+  [[http_service.checks]]
+    method = "GET"
+    path = "/livez"
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

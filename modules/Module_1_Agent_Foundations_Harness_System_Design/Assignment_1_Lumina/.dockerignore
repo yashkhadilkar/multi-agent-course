@@ -1,0 +1,22 @@
+# Build context for both Fly images (fly.agent.toml, fly.gateway.toml), sent to Fly's remote
+# builder. Secrets and local state never leave this machine; keys arrive as Fly secrets.
+.env
+.env.*
+**/node_modules
+**/dist
+.claude
+.vercel
+runs
+# Only the eval report reaches the gateway image.
+reports/*
+!reports/report.json
+# web/ is deployed by Vercel; its manifest is kept so npm ci sees the whole workspace.
+web/*
+!web/package.json
+benchmark
+eval
+quality
+scripts
+docker-compose.yml
+*.log
+.DS_Store
