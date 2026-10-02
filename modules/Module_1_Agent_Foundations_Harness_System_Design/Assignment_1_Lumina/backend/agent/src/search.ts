@@ -10,6 +10,7 @@
  */
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
+import { Agent, fetch as undiciFetch } from 'undici';
 import { env, secrets } from './env.js';
 
 export type SearchResult = { title: string; url: string; snippet: string };
@@ -43,15 +44,24 @@ export async function fetchPage(url: string, signal: AbortSignal): Promise<Fetch
 
 // ---------------------------------------------------------------- tavily
 
+/**
+ * Tavily's own connection pool. The global fetch drops an idle connection after 4 s, so the
+ * first search of each new question paid a fresh TLS handshake; this one keeps it for
+ * TAVILY_KEEPALIVE_MS. undici's fetch, not the global one, so the pool and the fetch that
+ * uses it are always the same undici version.
+ */
+const tavilyPool = new Agent({ keepAliveTimeout: env.tavilyKeepAliveMs, keepAliveMaxTimeout: env.tavilyKeepAliveMs });
+
 async function tavily(path: string, body: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
   if (!secrets.tavily) throw new SearchProviderError('TAVILY_API_KEY is not set');
-  let res: Response;
+  let res: Awaited<ReturnType<typeof undiciFetch>>;
   try {
-    res = await fetch(`https://api.tavily.com${path}`, {
+    res = await undiciFetch(`https://api.tavily.com${path}`, {
       method: 'POST',
       headers: { authorization: `Bearer ${secrets.tavily}`, 'content-type': 'application/json' },
       body: JSON.stringify(body),
-      signal
+      signal,
+      dispatcher: tavilyPool
     });
   } catch (err) {
     if (signal.aborted) throw err;
@@ -66,13 +76,13 @@ async function tavily(path: string, body: Record<string, unknown>, signal: Abort
 
 /**
  * Everything that affects Tavily's latency is pinned rather than left to its defaults:
- * basic depth, no generated answer, no raw page content (fetch_page reads pages), no
- * images, and no auto_parameters (which may pick a slower depth by itself). Measured:
- * Tavily's own response_time is 0.8-2.5 s for basic search and the network adds ~0.3 s;
- * nothing else in this call is ours to trim.
+ * the depth from TAVILY_SEARCH_DEPTH (basic unless set), no generated answer, no raw page
+ * content (fetch_page reads pages), no images, and no auto_parameters (which may pick a
+ * slower depth by itself). Measured over 20 bench questions: Tavily's own response_time
+ * was p50 530 ms for fast against 1060 ms for basic, and the network adds ~0.1 s.
  */
 const TAVILY_SEARCH = {
-  search_depth: 'basic',
+  search_depth: env.tavilySearchDepth,
   topic: 'general',
   max_results: MAX_RESULTS,
   include_answer: false,

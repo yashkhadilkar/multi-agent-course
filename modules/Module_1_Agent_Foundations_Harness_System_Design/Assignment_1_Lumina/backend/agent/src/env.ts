@@ -37,6 +37,22 @@ export const env = {
 
   searchProvider: oneOf('SEARCH_PROVIDER', SEARCH_PROVIDERS, 'tavily'),
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
+  /**
+   * Tavily's search_depth. Not part of the search cache key, which SPEC.md fixes as (query,
+   * provider): after a change, rows cached at the old depth are served until they expire
+   * (SEARCH_CACHE_TTL_SECONDS). fast measured p50 640 ms / p95 735 ms against basic's
+   * 1190 / 1526 at the same credit, but its one end-to-end pass was slower to first token
+   * (its pages read slower), so basic stays the default until a pass on questions Tavily has
+   * not cached says otherwise. ultra-fast returns one page summary per result instead of
+   * passages.
+   */
+  tavilySearchDepth: oneOf('TAVILY_SEARCH_DEPTH', ['advanced', 'basic', 'fast', 'ultra-fast'] as const, 'basic'),
+  /**
+   * How long an idle connection to api.tavily.com stays open for the next call. Node's
+   * default is 4 s, so each new question paid a fresh TLS handshake (~150-250 ms). Tavily
+   * held an idle connection past 330 s; keep this well under that.
+   */
+  tavilyKeepAliveMs: num(process.env.TAVILY_KEEPALIVE_MS, 60_000),
 
   /** A single page read gives up after this; one slow publisher must not eat the budget. */
   fetchTimeoutMs: num(process.env.FETCH_TIMEOUT_MS, 10000),
