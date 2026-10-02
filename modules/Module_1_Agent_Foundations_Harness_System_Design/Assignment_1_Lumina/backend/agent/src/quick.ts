@@ -30,7 +30,8 @@ import { z } from 'zod';
 import { newId, type RunLog, type Source, type Terminated, type ToolName } from '@lumina/contract';
 import { env, secrets } from './env.js';
 import { selectPassages } from './passages.js';
-import { FetchError, SearchProviderError, fetchPage, hostOf, webSearch, type SearchResult } from './search.js';
+import { FetchError, SearchProviderError, fetchPage, hostOf, type SearchResult } from './search.js';
+import { cachedWebSearch } from './searchCache.js';
 import { CitationFilter, SseStream } from './sse.js';
 
 /** Words of each fetched page the model reads. Four pages of this stay well inside quick's cost budget. */
@@ -150,7 +151,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   const pages: Page[] = [];
   const pageByUrl = new Map<string, Page>();
   const toolCalls: RunLog['toolCalls'] = [];
-  const usage = { in: 0, out: 0, searches: 0, extracts: 0 };
+  const usage = { in: 0, out: 0, searches: 0, extracts: 0, cacheHits: 0 };
 
   let capped = false;
   let snippetFallback = false;
@@ -214,7 +215,9 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     let results: SearchResult[];
     try {
       usage.searches++;
-      results = await webSearch(query, toolSignal());
+      const cached = await cachedWebSearch(query, toolSignal());
+      results = cached.results;
+      if (cached.hit) usage.cacheHits++;
     } catch (err) {
       if (abort.signal.aborted) throw err;
       // The provider is down: trace it, then end the run. There is nothing to answer from.
@@ -509,8 +512,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       model: env.llmModel,
       tokens: { in: usage.in, out: usage.out },
       costUsd: Math.round(costUsd * 1e6) / 1e6,
-      // No search cache yet, so no search was ever a hit.
-      searchCached: false,
+      // True only when every search this run made was a cache hit.
+      searchCached: usage.searches > 0 && usage.cacheHits === usage.searches,
       terminated,
       depth: 'quick' as const,
       subQuestions: 0
