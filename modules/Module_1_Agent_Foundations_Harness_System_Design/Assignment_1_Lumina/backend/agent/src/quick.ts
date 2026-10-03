@@ -204,7 +204,7 @@ const PROMPT_DOCUMENTS = 50;
 
 /** Where a chunk sits in its document, as the model and the trace read it. */
 export function where(l: Locator): string {
-  if (l.page !== undefined) return `p. ${l.page}`;
+  if (l.page !== undefined) return `p. ${l.page}${l.line !== undefined ? `, line ${l.line}` : ''}`;
   if (l.heading !== undefined) return `"${l.heading}"${l.line !== undefined ? `, line ${l.line}` : ''}`;
   return `line ${l.line}`;
 }

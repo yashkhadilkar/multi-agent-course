@@ -3,8 +3,9 @@
  *
  * Every chunk carries a locator, because a document citation is only as good as the place
  * it points at (SPEC 5.4):
- *   PDF       {page}            one segment per page, and no chunk crosses a page break,
- *                               so "p. N" is always exact
+ *   PDF       {page, line}      one segment per page, and no chunk crosses a page break,
+ *                               so "p. N" is always exact; the line (the page's text line
+ *                               the chunk starts on) keeps two chunks of one page apart
  *   Markdown  {heading, line}   one segment per ATX section, no chunk crosses a heading; the
  *                               line keeps two chunks of one long section apart
  *   Text      {line}            the line the chunk starts on
@@ -18,8 +19,12 @@ import type { ACCEPTED_UPLOAD_TYPES, Locator } from '@lumina/contract';
 
 export type AcceptedType = (typeof ACCEPTED_UPLOAD_TYPES)[number];
 
-/** A stretch of the document that no chunk may cross, with the locator its chunks inherit. */
-type Segment = { text: string; page?: number; heading?: string; startLine?: number };
+/**
+ * A stretch of the document that no chunk may cross, with the locator its chunks inherit.
+ * `lineStarts` is for text whose line breaks were collapsed (a PDF page): the offset in
+ * `text` where each of the source's lines begins, so a chunk still knows its line.
+ */
+type Segment = { text: string; page?: number; heading?: string; startLine?: number; lineStarts?: number[] };
 export type Piece = { ord: number; text: string; locator: Locator };
 export type Parsed = { segments: Segment[]; pages?: number };
 
@@ -38,17 +43,40 @@ async function parsePdf(bytes: Buffer): Promise<Parsed> {
     const segments: Segment[] = [];
     for (let page = 1; page <= pdf.numPages; page++) {
       const content = await (await pdf.getPage(page)).getTextContent();
-      const text = content.items
-        .map((item) => ('str' in item ? item.str + (item.hasEOL ? '\n' : '') : ''))
-        .join('')
-        .replace(/\s+/g, ' ')
-        .trim();
-      if (text) segments.push({ text, page });
+      const { text, lineStarts } = collapseLines(
+        content.items.map((item) => ('str' in item ? item.str + (item.hasEOL ? '\n' : '') : '')).join('')
+      );
+      if (text) segments.push({ text, page, startLine: 1, lineStarts });
     }
     return { segments, pages: pdf.numPages };
   } finally {
     await pdf.destroy();
   }
+}
+
+/**
+ * `raw.replace(/\s+/g, ' ').trim()`, which is what a PDF page's chunks are cut from, plus
+ * the offset in the result where each non-empty line of `raw` begins.
+ */
+export function collapseLines(raw: string): { text: string; lineStarts: number[] } {
+  let text = '';
+  const lineStarts = [0];
+  let space = false;
+  let newline = false;
+  for (const ch of raw) {
+    if (/\s/.test(ch)) {
+      if (text) {
+        space = true;
+        if (ch === '\n') newline = true;
+      }
+      continue;
+    }
+    if (space) text += ' ';
+    if (newline) lineStarts.push(text.length);
+    space = newline = false;
+    text += ch;
+  }
+  return { text, lineStarts };
 }
 
 // ---------------------------------------------------------------- Markdown
@@ -139,7 +167,10 @@ export function chunkSegments(segments: Segment[], size: number, overlap: number
     for (const [start, end] of splitRanges(seg.text, size, overlap)) {
       const text = seg.text.slice(start, end).trim();
       if (!text) continue;
-      const line = seg.startLine === undefined ? undefined : seg.startLine + countNewlines(seg.text, start);
+      const line =
+        seg.startLine === undefined
+          ? undefined
+          : seg.startLine + (seg.lineStarts ? countBefore(seg.lineStarts, start) - 1 : countNewlines(seg.text, start));
       const locator: Locator = {
         ...(seg.page !== undefined ? { page: seg.page } : {}),
         ...(seg.heading !== undefined ? { heading: seg.heading } : {}),
@@ -149,6 +180,13 @@ export function chunkSegments(segments: Segment[], size: number, overlap: number
     }
   }
   return pieces;
+}
+
+/** How many of the sorted `offsets` are at or before `at`. */
+function countBefore(offsets: number[], at: number): number {
+  let n = 0;
+  while (n < offsets.length && offsets[n]! <= at) n++;
+  return n;
 }
 
 function countNewlines(text: string, end: number): number {
