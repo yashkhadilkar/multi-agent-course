@@ -724,7 +724,7 @@ export async function runDeep(ask: DeepAsk, res: Response, log: Logger): Promise
       ttftMs: ttftMs ?? latencyMs,
       model: env.llmModel,
       tokens: { in: inputTokens(usage), out: usage.out },
-      costUsd: Math.round(costUsd(usage) * 1e6) / 1e6,
+      costUsd: Math.round(costUsd(env.llmModel, usage) * 1e6) / 1e6,
       searchCached: cache.searches > 0 && cache.hits === cache.searches,
       terminated,
       depth: 'deep',

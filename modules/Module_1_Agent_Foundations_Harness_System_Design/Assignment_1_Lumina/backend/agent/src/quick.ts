@@ -69,20 +69,25 @@ const PAGE_WORDS = 500;
 const ANSWER_RESERVE_MS = 15_000;
 /** Thinking counts against this too. It bounds the cost of any one turn. */
 const MAX_TOKENS_PER_TURN = 2048;
-/** How many of the first search's results are read before the model is called. */
-const PREFETCH_PAGES = 3;
 /**
- * The up-front reads stop waiting once this many pages are in and citable, giving the rest
- * PREFETCH_GRACE_MS more. Waiting for the slowest of three put that one publisher on the path
- * to the first token; a read it stops is traced as failed, and fetch_page can retry it.
+ * The path to the first token is configuration (env.ts, QUICK_*):
+ *   quickPrefetchPages     how many of the first search's results are read before the model is called;
+ *   quickPrefetchEnough    the up-front reads stop waiting once this many pages are in and citable,
+ *   quickPrefetchGraceMs   giving the rest this much more. Waiting for the slowest of three put that
+ *                          one publisher on the path to the first token; a read it stops is traced as
+ *                          failed, and fetch_page can retry it;
+ *   quickCommitAfterChars  with pages in hand the model may answer at once, or open with a preamble
+ *                          and then call a tool. Its text is committed as the answer once it cites a
+ *                          source or runs this long.
  */
-const PREFETCH_ENOUGH = 2;
-const PREFETCH_GRACE_MS = 200;
+
 /**
- * With pages in hand the model may answer at once, or open with a preamble and then call a
- * tool. Its text is committed as the answer once it cites a source or runs this long.
+ * Haiku 4.5 takes neither adaptive thinking nor effort (both are a 400 there), so it runs
+ * without; every other quick model keeps adaptive thinking at low effort.
  */
-const COMMIT_AFTER_CHARS = 160;
+const THINKING: Pick<Anthropic.MessageStreamParams, 'thinking' | 'output_config'> = /^claude-haiku-4-5\b/.test(env.quickModel)
+  ? {}
+  : { thinking: { type: 'adaptive' }, output_config: { effort: 'low' } };
 /**
  * The cost guard's estimates (extraRoundFits). Output per call: a quick answer runs 100 to
  * 600 tokens, a tool call 200 to 250. Tool results: a search's five results, a page's
@@ -817,8 +822,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
 
   /**
    * The up-front reads of the first search's top results, in parallel. Steps are reserved in
-   * rank order before any await. Once PREFETCH_ENOUGH pages are in and citable, the rest get
-   * PREFETCH_GRACE_MS, then are stopped: each is traced as a failed step with why, and the
+   * rank order before any await. Once QUICK_PREFETCH_ENOUGH pages are in and citable, the rest get
+   * QUICK_PREFETCH_GRACE_MS, then are stopped: each is traced as a failed step with why, and the
    * model is told it can retry. Anything else that stops them (the run, a failed sibling in
    * `parent`) still ends the run.
    */
@@ -828,14 +833,14 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     let kept = 0;
     let grace: NodeJS.Timeout | undefined;
     const stopRest = () =>
-      enough.abort(new Error(`not waited for: ${PREFETCH_ENOUGH} pages were already read when it had not finished`));
+      enough.abort(new Error(`not waited for: ${env.quickPrefetchEnough} pages were already read when it had not finished`));
     try {
       return await Promise.all(
         top.map((r) => {
           const s = reserve('fetch_page');
           return runFetchPage(s, { url: r.url, reason: 'top result, read up front' }, env.prefetchTimeoutMs, signal).then(
             (res) => {
-              if (!res.isError && ++kept === PREFETCH_ENOUGH && kept < top.length) grace = setTimeout(stopRest, PREFETCH_GRACE_MS);
+              if (!res.isError && ++kept === env.quickPrefetchEnough && kept < top.length) grace = setTimeout(stopRest, env.quickPrefetchGraceMs);
               return res;
             },
             (err: unknown) => {
@@ -904,9 +909,9 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     const nextIn = lastIn + last.usage.output_tokens + uses.reduce((n, u) => n + (EST_RESULT_TOKENS[u.name] ?? 1000), 0);
     // The next call reads what is cached and writes the rest (breakpoint 3); the reserved
     // answer call reads only the tools and system prompt, so it is priced uncached.
-    const nextUsd = llmCostUsd({ in: 0, cacheRead: cached, cacheWrite: nextIn - cached, out: EST_OUTPUT_TOKENS });
-    const answerUsd = llmCostUsd({ in: nextIn + EST_OUTPUT_TOKENS, cacheRead: 0, cacheWrite: 0, out: EST_OUTPUT_TOKENS });
-    const projectedUsd = costUsd(usage) + toolsUsd + nextUsd + answerUsd;
+    const nextUsd = llmCostUsd(env.quickModel, { in: 0, cacheRead: cached, cacheWrite: nextIn - cached, out: EST_OUTPUT_TOKENS });
+    const answerUsd = llmCostUsd(env.quickModel, { in: nextIn + EST_OUTPUT_TOKENS, cacheRead: 0, cacheWrite: 0, out: EST_OUTPUT_TOKENS });
+    const projectedUsd = costUsd(env.quickModel, usage) + toolsUsd + nextUsd + answerUsd;
     return { fits: projectedUsd <= env.maxCostPerAnswerUsd, projectedUsd: Math.round(projectedUsd * 1e6) / 1e6 };
   }
 
@@ -925,13 +930,12 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     let firstTextMs = null as number | null;
     const stream = llm().messages.stream(
       {
-        model: env.llmModel,
+        model: env.quickModel,
         max_tokens: MAX_TOKENS_PER_TURN,
         system: cachedSystem,
         tools,
         tool_choice: { type: mode === 'answer' ? 'none' : 'auto' },
-        thinking: { type: 'adaptive' },
-        output_config: { effort: 'low' },
+        ...THINKING,
         // The tail is cached only once a run is already on a later call and may make another.
         messages: withBreakpoints(mode === 'auto' && timing.turns.length > 0)
       },
@@ -953,7 +957,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       if (sources) write(ev.delta.text);
       else {
         held += ev.delta.text;
-        const answering = forceAnswer || /\[\d/.test(held) || held.length >= COMMIT_AFTER_CHARS;
+        const answering = forceAnswer || /\[\d/.test(held) || held.length >= env.quickCommitAfterChars;
         if (!sawToolUse && (forceAnswer || retrieved.length > 0) && answering) {
           beginAnswer(retrievedSources());
           write(held);
@@ -1017,7 +1021,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
         timing.firstStepMs = since();
         // Reserved per result in prefetch, in rank order. These count toward the thrash
         // guard's streak like any fetch_page the model makes.
-        const top = found.results.slice(0, Math.max(0, Math.min(PREFETCH_PAGES, env.maxToolCalls - step)));
+        const top = found.results.slice(0, Math.max(0, Math.min(env.quickPrefetchPages, env.maxToolCalls - step)));
         const reads = await prefetch(top, batch);
         timing.readsMs = since();
         return { found, top, reads };
@@ -1213,10 +1217,10 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       answerId,
       latencyMs,
       ttftMs: ttftMs ?? latencyMs,
-      model: env.llmModel,
+      model: env.quickModel,
       // Every input token, cached or not; cache reads and writes differ only in price.
       tokens: { in: inputTokens(usage), out: usage.out },
-      costUsd: Math.round(costUsd(usage) * 1e6) / 1e6,
+      costUsd: Math.round(costUsd(env.quickModel, usage) * 1e6) / 1e6,
       // Only when every search in the request hit. No search at all is not a hit.
       searchCached: cache.searches > 0 && cache.hits === cache.searches,
       terminated,

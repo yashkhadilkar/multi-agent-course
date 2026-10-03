@@ -33,7 +33,10 @@ export const env = {
   vectorBackend: oneOf('VECTOR_BACKEND', VECTOR_BACKENDS, 'atlas-vector-search'),
 
   llmProvider: str(process.env.LLM_PROVIDER, 'anthropic'),
+  /** Deep search's model, and quick's unless QUICK_LLM_MODEL says otherwise. */
   llmModel: str(process.env.LLM_MODEL, 'claude-sonnet-5'),
+  /** The quick gear's model. Priced at its own rate (pricing.ts), whatever deep runs on. */
+  quickModel: str(process.env.QUICK_LLM_MODEL, str(process.env.LLM_MODEL, 'claude-sonnet-5')),
 
   searchProvider: oneOf('SEARCH_PROVIDER', SEARCH_PROVIDERS, 'tavily'),
   searchCacheTtlSeconds: num(process.env.SEARCH_CACHE_TTL_SECONDS, 21600),
@@ -59,13 +62,17 @@ export const env = {
   /** The up-front reads of the top results get much less: they are on the path to the first token. */
   prefetchTimeoutMs: num(process.env.PREFETCH_TIMEOUT_MS, 1500),
 
-  // Prices behind done.costUsd. The defaults are the declared table in
-  // benchmark/sla.json (cost_model), so the agent and the bench price a run the same way.
-  llmInputUsdPerMtok: num(process.env.LLM_INPUT_USD_PER_MTOK, 3.0),
-  llmOutputUsdPerMtok: num(process.env.LLM_OUTPUT_USD_PER_MTOK, 15.0),
-  // Prompt caching: a 5-minute cache write is 1.25x the input rate, a cache read 0.1x.
-  llmCacheWriteUsdPerMtok: num(process.env.LLM_CACHE_WRITE_USD_PER_MTOK, 1.25 * num(process.env.LLM_INPUT_USD_PER_MTOK, 3.0)),
-  llmCacheReadUsdPerMtok: num(process.env.LLM_CACHE_READ_USD_PER_MTOK, 0.1 * num(process.env.LLM_INPUT_USD_PER_MTOK, 3.0)),
+  // The quick gear's path to the first token (quick.ts). Each is a latency/grounding trade.
+  /** How many of the first search's results are read before the model is called. */
+  quickPrefetchPages: num(process.env.QUICK_PREFETCH_PAGES, 3),
+  /** The up-front reads stop waiting once this many pages are in and citable... */
+  quickPrefetchEnough: num(process.env.QUICK_PREFETCH_ENOUGH, 2),
+  /** ...giving the rest this much longer. */
+  quickPrefetchGraceMs: num(process.env.QUICK_PREFETCH_GRACE_MS, 200),
+  /** Text is committed as the answer once it cites a source or runs this long. */
+  quickCommitAfterChars: num(process.env.QUICK_COMMIT_AFTER_CHARS, 40),
+
+  // Model prices behind done.costUsd live in pricing.ts, per model. Tavily's are here.
   searchUsdPerCall: num(process.env.SEARCH_USD_PER_CALL, 0.008),
   /** sla.json max_cost_per_answer_usd: a quick run makes no extra model call that would take it past this. */
   maxCostPerAnswerUsd: num(process.env.MAX_COST_PER_ANSWER_USD, 0.05),
@@ -124,6 +131,13 @@ if (env.ragTopK < 1 || env.ragCandidates < env.ragTopK || env.ragRrfK < 0) {
 // An overlap as long as the chunk never advances; refuse it at boot rather than spin.
 if (env.chunkOverlapChars < 0 || env.chunkOverlapChars >= env.chunkSizeChars) {
   throw new Error(`CHUNK_OVERLAP_CHARS (${env.chunkOverlapChars}) must be at least 0 and below CHUNK_SIZE_CHARS (${env.chunkSizeChars})`);
+}
+
+if (env.quickPrefetchPages < 0 || env.quickPrefetchEnough < 1 || env.quickPrefetchGraceMs < 0 || env.quickCommitAfterChars < 0) {
+  throw new Error(
+    `QUICK_PREFETCH_PAGES (${env.quickPrefetchPages}) and QUICK_PREFETCH_GRACE_MS (${env.quickPrefetchGraceMs}) must not be negative, ` +
+      `QUICK_PREFETCH_ENOUGH (${env.quickPrefetchEnough}) must be at least 1, and QUICK_COMMIT_AFTER_CHARS (${env.quickCommitAfterChars}) not negative`
+  );
 }
 
 /** Never log or return these. /health names the model; it never echoes a key. */
