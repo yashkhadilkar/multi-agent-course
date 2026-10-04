@@ -54,7 +54,7 @@ import { MAX_MEMORY_CHARS, recallMemories, saveMemory, type RecalledMemory } fro
 import { selectPassages, unwrap } from './passages.js';
 import { addMessageUsage, costUsd, emptyUsage, inputTokens, llmCostUsd, toolCostUsd } from './pricing.js';
 import { DocumentSearchError, searchDocuments, type SpaceContents } from './retrieval.js';
-import { recordAnswer } from './runlog.js';
+import { recordAnswer, type CostStop } from './runlog.js';
 import { FetchError, SearchProviderError, hostOf, type SearchResult } from './search.js';
 import { CitationFilter, SseStream } from './sse.js';
 import type { SavedAnswer } from './threads.js';
@@ -95,6 +95,8 @@ const THINKING: Pick<Anthropic.MessageStreamParams, 'thinking' | 'output_config'
  */
 const EST_OUTPUT_TOKENS = 600;
 const EST_RESULT_TOKENS: Record<string, number> = { web_search: 600, fetch_page: 800, search_documents: 1500, save_memory: 50 };
+/** Below this many output tokens a model call cannot write a useful answer, so it is not made. */
+const MIN_ANSWER_TOKENS = 150;
 
 // ---------------------------------------------------------------- tools
 
@@ -405,14 +407,19 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
   const refused: { step: number; tool: ToolName }[] = [];
   // `searches` is provider calls, the ones that cost money; a cache hit is not one.
   const usage = emptyUsage();
-  /** Set when the cost guard stopped a round of tools, with what it projected. */
-  let costStop = null as { projectedUsd: number; tools: string[] } | null;
+  /**
+   * Set when the budget stopped the run: the round of tools refused and what the guard
+   * projected, and the output tokens the answer call was then held to (0: no call was made).
+   * Stored on the request record, not only logged.
+   */
+  let costStop = null as CostStop | null;
   /** Where the time before the first token went, in ms from the start of the run. Logged with the answer. */
   const timing = {
     firstStepMs: null as number | null,
     readsMs: null as number | null,
     turns: [] as {
       mode: 'auto' | 'answer';
+      maxTokens: number;
       startMs: number;
       firstThinkingMs: number | null;
       firstTextMs: number | null;
@@ -915,6 +922,32 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     return { fits: projectedUsd <= env.maxCostPerAnswerUsd, projectedUsd: Math.round(projectedUsd * 1e6) / 1e6 };
   }
 
+  /**
+   * The most output tokens the next model call can write and still leave the run inside its
+   * budget. Every call after the first is held to it, so the guard's estimate is never what
+   * stands between a run and an overspend: the answer forced after a refusal is held too.
+   * Input is priced at its worst: the cached prefix as if the cache missed and was written
+   * again, the rest uncached (or written, on an auto turn, which caches its tail), and the
+   * message added since `last` at two characters a token.
+   */
+  function budgetTokens(last: Anthropic.Message, addedChars: number, mode: 'auto' | 'answer'): number {
+    const lastIn = last.usage.input_tokens + (last.usage.cache_creation_input_tokens ?? 0) + (last.usage.cache_read_input_tokens ?? 0);
+    const cached = (last.usage.cache_read_input_tokens ?? 0) + (last.usage.cache_creation_input_tokens ?? 0);
+    const nextIn = lastIn + last.usage.output_tokens + Math.ceil(addedChars / 2);
+    const uncached = mode === 'auto' ? 0 : nextIn - cached;
+    const inputUsd = llmCostUsd(env.quickModel, { in: uncached, cacheWrite: nextIn - uncached, cacheRead: 0, out: 0 });
+    const perToken = llmCostUsd(env.quickModel, { in: 0, cacheWrite: 0, cacheRead: 0, out: 1 });
+    const left = env.maxCostPerAnswerUsd - costUsd(env.quickModel, usage) - inputUsd;
+    return Math.max(0, Math.min(MAX_TOKENS_PER_TURN, Math.floor(left / perToken)));
+  }
+
+  /**
+   * Asks the forced answer to fit the tokens it will be held to, so it ends rather than being
+   * cut off. A cited answer with bullets runs about 0.43 words a token (measured: 203 words in
+   * 472), so 0.35 leaves room for the model overshooting the count it was given.
+   */
+  const keepUnder = (tokens: number) => (tokens >= MIN_ANSWER_TOKENS ? ` Keep it under ${Math.floor(tokens * 0.35)} words.` : '');
+
   // ---------------------------------------------------------------- one model turn
 
   /**
@@ -924,24 +957,26 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
    *
    * `held` is text from a turn that ended with nothing citable, for the caller to decide on.
    */
-  async function turn(mode: 'auto' | 'answer'): Promise<{ msg: Anthropic.Message; held: string }> {
+  async function turn(mode: 'auto' | 'answer', maxTokens: number): Promise<{ msg: Anthropic.Message; held: string }> {
     const startMs = since();
     let firstThinkingMs = null as number | null;
     let firstTextMs = null as number | null;
+    const forceAnswer = mode === 'answer';
     const stream = llm().messages.stream(
       {
         model: env.quickModel,
-        max_tokens: MAX_TOKENS_PER_TURN,
+        max_tokens: maxTokens,
         system: cachedSystem,
         tools,
-        tool_choice: { type: mode === 'answer' ? 'none' : 'auto' },
-        ...THINKING,
+        tool_choice: { type: forceAnswer ? 'none' : 'auto' },
+        // A forced answer writes up what is already read; thinking would bill at the output
+        // rate against the little budget left.
+        ...(forceAnswer ? {} : THINKING),
         // The tail is cached only once a run is already on a later call and may make another.
         messages: withBreakpoints(mode === 'auto' && timing.turns.length > 0)
       },
       { signal: abort.signal }
     );
-    const forceAnswer = mode === 'answer';
 
     // Text is committed to the client only once it can only be the answer: when tools are
     // off, or when there is something to cite, no tool call has appeared in this turn, and
@@ -975,6 +1010,7 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     addMessageUsage(usage, msg.usage);
     timing.turns.push({
       mode,
+      maxTokens,
       startMs,
       firstThinkingMs,
       firstTextMs,
@@ -1074,8 +1110,22 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
     });
 
     let mode: 'auto' | 'answer' = 'auto';
+    let last = null as Anthropic.Message | null;
     for (;;) {
-      const { msg, held } = await turn(mode);
+      // The first call is the answer's base cost. Every call after it is held inside what the
+      // budget has left, and is not made at all when that is too little to answer with.
+      const maxTokens = last ? budgetTokens(last, JSON.stringify(messages.at(-1)?.content ?? '').length, mode) : MAX_TOKENS_PER_TURN;
+      if (maxTokens < MIN_ANSWER_TOKENS) {
+        capped = true;
+        costStop = { ...(costStop ?? { projectedUsd: Math.round(costUsd(env.quickModel, usage) * 1e6) / 1e6, tools: [] }), answerMaxTokens: 0 };
+        log.info({ requestId: ask.requestId, maxTokens, budgetUsd: env.maxCostPerAnswerUsd }, 'cost budget: no room for another model call');
+        beginAnswer(sources ?? retrievedSources());
+        emit('The research budget for this search ran out before an answer could be written. What it found is listed as sources.');
+        break;
+      }
+      if (mode === 'answer' && costStop) costStop.answerMaxTokens = maxTokens;
+      const { msg, held } = await turn(mode, maxTokens);
+      last = msg;
       if (sources) {
         if (msg.content.some((b) => b.type === 'tool_use')) {
           log.warn({ requestId: ask.requestId }, 'model called a tool after starting its answer; the call was not run');
@@ -1086,8 +1136,12 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       const uses = msg.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use');
       if (uses.length) {
         messages.push({ role: 'assistant', content: msg.content });
-        // The cost guard, before another model call is committed to.
-        const guard = extraRoundFits(uses, msg);
+        // The cost guard, before another model call is committed to. A tool call cut off at
+        // max_tokens is the budget running out mid-call, and its input may be incomplete.
+        const guard =
+          msg.stop_reason === 'max_tokens'
+            ? { fits: false, projectedUsd: Math.round(costUsd(env.quickModel, usage) * 1e6) / 1e6 }
+            : extraRoundFits(uses, msg);
         let results: Anthropic.ToolResultBlockParam[];
         if (guard.fits) results = await runTools(uses);
         else {
@@ -1108,9 +1162,11 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
           capped = true;
           mode = 'answer';
           const spent = timeLow ? 'time' : costStop ? 'cost' : `${env.maxToolCalls} tool calls`;
+          // Sized with room for this sentence; the loop recomputes the exact hold before the call.
+          const room = budgetTokens(msg, JSON.stringify(content).length + 400, 'answer');
           content.push({
             type: 'text',
-            text: `The research budget for this search is spent (${spent}). Write the answer now from what was already read, and say in one sentence that the research stopped early.`
+            text: `The research budget for this search is spent (${spent}). Write the answer now from what was already read, and say in one sentence that the research stopped early.${keepUnder(room)}`
           });
         }
         messages.push({ role: 'user', content });
@@ -1129,11 +1185,13 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
           .map((r, i) => ({ n: i + 1, kind: 'web', title: r.title, url: r.url, snippet: r.snippet }));
         log.warn({ requestId: ask.requestId, sources: list.length }, 'no page could be read; answering from search snippets');
         messages.push({ role: 'assistant', content: msg.content });
+        const snippets = list.map((s) => `[${s.n}] ${s.title}\n${s.url}\n${s.snippet}`).join('\n\n') || '(none of the results had a snippet)';
+        const room = budgetTokens(msg, snippets.length + 500, 'answer');
         messages.push({
           role: 'user',
           content:
-            `${capped ? 'The tool-call budget ran out before any page was read' : 'No page could be read'}, so answer from these search snippets instead, and say in one sentence that the answer rests on search snippets rather than full pages${capped ? ' because the research stopped early' : ''}. Cite them by these numbers:\n\n` +
-            (list.map((s) => `[${s.n}] ${s.title}\n${s.url}\n${s.snippet}`).join('\n\n') || '(none of the results had a snippet)')
+            `${capped ? 'The tool-call budget ran out before any page was read' : 'No page could be read'}, so answer from these search snippets instead, and say in one sentence that the answer rests on search snippets rather than full pages${capped ? ' because the research stopped early' : ''}.${keepUnder(room)} Cite them by these numbers:\n\n` +
+            snippets
         });
         beginAnswer(list);
         mode = 'answer';
@@ -1283,7 +1341,8 @@ export async function runQuick(ask: QuickAsk, res: Response, log: Logger): Promi
       tokensIn: done.tokens.in,
       tokensOut: done.tokens.out,
       ttftMs: done.ttftMs,
-      searchCached: done.searchCached
+      searchCached: done.searchCached,
+      costStop
     });
   }
 }

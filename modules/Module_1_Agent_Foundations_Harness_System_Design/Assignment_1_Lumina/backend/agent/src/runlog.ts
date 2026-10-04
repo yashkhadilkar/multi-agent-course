@@ -29,7 +29,12 @@ export type AnswerRecord = {
   tokensOut: number;
   ttftMs: number;
   searchCached: boolean;
+  /** The quick gear's budget stop, when there was one. */
+  costStop?: CostStop | null;
 };
+
+/** What the quick gear's cost budget did: the tools it refused, and what the answer call was held to. */
+export type CostStop = { projectedUsd: number; tools: string[]; answerMaxTokens?: number };
 
 /**
  * Written before `done` goes out, so a client that has seen `done` can already see the
@@ -64,7 +69,9 @@ export async function recordAnswer(a: AnswerRecord): Promise<void> {
     }),
     // Beyond the contract's key fields: what /stats needs for its latency and cache numbers.
     ttftMs: a.ttftMs,
-    searchCached: a.searchCached
+    searchCached: a.searchCached,
+    // Why a capped run stopped, kept with the record: the log line alone is gone within hours.
+    ...(a.costStop ? { costStop: a.costStop } : {})
   };
   const d = await db();
   await Promise.all([
