@@ -1,0 +1,12 @@
+{
+  "id": "R3",
+  "title": "Every citation locator is unique within its document",
+  "type": "contract",
+  "severity": "error",
+  "rule": "No two chunks of the same document may share a locator, meaning the same docId, page, heading, and line, so a citation's locator always points to exactly one chunk.",
+  "precedent": [
+    "LUMINA, cohort 2026-03, 2026-10-02: PDF chunks were given page-only locators, so a page split into several chunks gave all of them the same locator. The bench looks up a cited chunk by its locator, so each chunk on a page overwrote the last, and correct snippets were checked against the wrong chunk's text. The smoke run scored citation grounding at 0.79 (15 of 19) against a 0.95 threshold even though every snippet was real, which would have stopped the eval at Gate 2 and misscored all 30 document questions in the full run. Caught by reading the failed citations before paying for the full run, and fixed by adding the starting line to each locator, which brought grounding back to 19 of 19."
+  ],
+  "selfCheck": "Group your chunks by document and locator. Does any group have more than one chunk?",
+  "params": {}
+}

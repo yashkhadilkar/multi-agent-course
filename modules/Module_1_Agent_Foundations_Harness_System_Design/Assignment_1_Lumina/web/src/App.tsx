@@ -181,6 +181,7 @@ export function App({ route }: { route: 'app' | 'evals' }) {
             Ask
           </a>
           <a href="/evals">Evals</a>
+          <a href="/rules">Rules</a>
         </nav>
         <span className="spacer" />
         <div className="userbox">

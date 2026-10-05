@@ -2,6 +2,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { EvalsPage } from './EvalsPage';
+import { RulesPage } from './RulesPage';
 import './styles.css';
 
 /**
@@ -10,8 +11,10 @@ import './styles.css';
  * rewrite is for.
  */
 const path = window.location.pathname.replace(/\/+$/, '');
-const route = path === '/evals' ? 'evals' : 'app';
+const route = path === '/evals' ? 'evals' : path === '/rules' ? 'rules' : 'app';
 
 createRoot(document.getElementById('root')!).render(
-  <StrictMode>{route === 'evals' ? <EvalsPage /> : <App route="app" />}</StrictMode>
+  <StrictMode>
+    {route === 'evals' ? <EvalsPage /> : route === 'rules' ? <RulesPage /> : <App route="app" />}
+  </StrictMode>
 );

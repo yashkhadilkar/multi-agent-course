@@ -248,6 +248,7 @@ function Shell({ children }: { children: React.ReactNode }) {
           <a href="/evals" className="on">
             Evals
           </a>
+          <a href="/rules">Rules</a>
         </nav>
       </header>
       <div className="evals">{children}</div>
